@@ -10,7 +10,7 @@ const uint16_t GpioAlarmController::kBuzzerPin = GPIO_PIN_10;
 const uint16_t GpioAlarmController::kOutputPins =
     static_cast<uint16_t>(GpioAlarmController::kLedPin | GpioAlarmController::kBuzzerPin);
 const int GpioAlarmController::kBuzzerOnMs = 200;
-const int GpioAlarmController::kBuzzerOffMs = 100;
+const int GpioAlarmController::kBuzzerOffMs = 50;
 
 GpioAlarmController::GpioAlarmController()
     : gpio_(NULL), initialized_(false), buzzer_on_(false), last_toggle_ms_(0) {}
