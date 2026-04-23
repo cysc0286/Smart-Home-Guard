@@ -9,12 +9,12 @@
 | `yolov8n.pt` | YOLOv8n 预训练权重（COCO 80类，来源：Ultralytics） |
 | `yolov8n_coco_head6.onnx` | 从 `.pt` 导出的 Head6 格式 ONNX，用于上传思思AI平台转换 |
 | `export_onnx.py` | 导出脚本，将 `.pt` 转为板端所需的 Head6 ONNX 格式 |
-| `app.py` | 上位机控制程序（待开发），规划用于摄像头画面观察 + 危险区域框定 |
+| `app.py` | 视频帧提取工具，用于从视频中筛选含有人物的帧 |
 | `requirements.txt` | Python 依赖 |
 
 ## 模型导出流程
 
-```
+```text
 yolov8n.pt
   ↓  python export_onnx.py
 yolov8n_coco_head6.onnx
@@ -37,14 +37,15 @@ yolov8n_coco.m1model
 
 板端 C++ 代码负责 DFL 解码、sigmoid、NMS，模型本身输出裸 logits。
 
-## app.py（上位机，规划中）
+## app.py（视频帧提取工具）
 
-当前文件内容为旧版视频帧提取脚本（已废弃），**待改写**为：
+当前 `app.py` 是一个独立的视频帧人物提取脚本，可用于：
 
-- 接收板端 MJPEG 视频流，实时显示摄像头画面
-- 鼠标在画面上绘制危险区域（矩形 / 多边形）
-- 将区域坐标发送到板端（TCP），板端读取后判断入侵并报警
-- 满足比赛"可视化展示界面"评分项
+- 从本地视频中筛选包含人物的帧
+- 保存整帧或人物裁剪图
+- 为后续数据整理、演示素材准备提供支持
+
+上位机禁区画框控制程序已移至项目根目录下的 `pc_controller/` 目录。
 
 ## 板端编译流程（参考）
 
