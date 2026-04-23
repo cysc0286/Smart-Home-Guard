@@ -2,6 +2,7 @@
 #include <mutex>
 #include <thread>
 #include <unistd.h>
+#include <chrono>
 
 #include "include/gpio_alarm_controller.hpp"
 
@@ -81,6 +82,9 @@ int main() {
 
   std::thread listener_thread(keyboard_listener);
 
+  auto last_det_log_time = std::chrono::steady_clock::now();
+  constexpr int kDetLogIntervalMs = 500;
+
   while (!check_exit_flag()) {
     processor.GetImage(&img_sensor);
     detector.Predict(&img_sensor, &det_result, coco_config::kConfThreshold);
@@ -93,9 +97,15 @@ int main() {
     const bool has_object = !stable.detections.empty();
     gpio_alarm.Update(has_object);
 
-    for (const auto& det : stable.detections) {
-      printf("[DET] %s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n", det.label.c_str(), det.score,
-             det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+    const auto now = std::chrono::steady_clock::now();
+    const auto log_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_det_log_time).count();
+    if (log_elapsed_ms >= kDetLogIntervalMs) {
+      for (const auto& det : stable.detections) {
+        printf("[DET] %s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n", det.label.c_str(), det.score,
+               det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+      }
+      last_det_log_time = now;
     }
 
     visualizer.Draw(tracker.ConfirmedBoxes());
