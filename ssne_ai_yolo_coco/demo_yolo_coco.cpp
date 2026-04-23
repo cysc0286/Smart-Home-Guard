@@ -73,7 +73,7 @@ int main() {
     return -1;
   }
 
-  cout << "sleep for 0.2 second!" << endl;
+  cout << "sleep for 0.2 second!!" << endl;
   usleep(200000);
 
   ssne_tensor_t       img_sensor;
