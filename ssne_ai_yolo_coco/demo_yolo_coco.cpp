@@ -51,15 +51,17 @@ int main() {
   std::string        model_path = coco_config::kModelPath;
 
   if (ssne_initial()) {
-    fprintf(stderr, "SSNE initialization failed!\n");
+    fprintf(stderr, "[INIT] SSNE initialization failed!\n");
     return -1;
   }
+  printf("[INIT] SSNE initialized\n");
 
   IMAGEPROCESSOR processor;
   processor.Initialize(&img_shape);
 
   COCO_DETECTOR detector;
   detector.Initialize(model_path, &crop_shape, &det_shape);
+  printf("[INIT] Detector loaded: %s\n", model_path.c_str());
 
   VISUALIZER visualizer;
   visualizer.Initialize(img_shape, "shared_colorLUT.sscl");
@@ -72,9 +74,10 @@ int main() {
     ssne_release();
     return -1;
   }
+  printf("[INIT] GPIO alarm ready\n");
 
-  cout << "sleep for 0.2 second!!" << endl;
   usleep(200000);
+  printf("[INIT] System ready -- input q to quit\n");
 
   ssne_tensor_t       img_sensor;
   CocoDetectionResult det_result;
@@ -82,8 +85,9 @@ int main() {
 
   std::thread listener_thread(keyboard_listener);
 
-  auto last_det_log_time = std::chrono::steady_clock::now();
-  constexpr int kDetLogIntervalMs = 500;
+  auto last_log_time = std::chrono::steady_clock::now();
+  constexpr int kDetLogIntervalMs  = 500;
+  constexpr int kIdleLogIntervalMs = 5000;
 
   while (!check_exit_flag()) {
     processor.GetImage(&img_sensor);
@@ -99,13 +103,19 @@ int main() {
 
     const auto now = std::chrono::steady_clock::now();
     const auto log_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_det_log_time).count();
-    if (log_elapsed_ms >= kDetLogIntervalMs) {
-      for (const auto& det : stable.detections) {
-        printf("[DET] %s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n", det.label.c_str(), det.score,
-               det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+        now - last_log_time).count();
+    const int log_interval = has_object ? kDetLogIntervalMs : kIdleLogIntervalMs;
+    if (log_elapsed_ms >= log_interval) {
+      if (has_object) {
+        for (const auto& det : stable.detections) {
+          printf("[DET]  %-10s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n",
+                 det.label.c_str(), det.score,
+                 det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+        }
+      } else {
+        printf("[IDLE] no detection\n");
       }
-      last_det_log_time = now;
+      last_log_time = now;
     }
 
     visualizer.Draw(tracker.ConfirmedBoxes());

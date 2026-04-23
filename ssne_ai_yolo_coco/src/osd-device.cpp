@@ -26,7 +26,6 @@ OsdDevice::OsdDevice()
 }
 
 OsdDevice::~OsdDevice(){
-    std::cout << "OsdDevice Destructor" << std::endl;
 }
 
 void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
@@ -36,10 +35,7 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
     // load osd color lut
     // 如果提供了位图LUT路径，优先使用位图LUT；否则使用默认LUT
     if (bitmap_lut_path != nullptr && strlen(bitmap_lut_path) > 0) {
-        if (LoadLutFile(bitmap_lut_path) == 0) {
-            std::cout << "[OsdDevice] Using bitmap LUT: " << bitmap_lut_path << std::endl;
-        } else {
-            // 如果位图LUT加载失败，回退到默认LUT
+        if (LoadLutFile(bitmap_lut_path) != 0) {
             std::cerr << "[OsdDevice] Warning: Failed to load bitmap LUT, using default LUT" << std::endl;
             LoadLutFile(m_osd_lut_path.c_str());
         }
@@ -55,7 +51,7 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
     // init quad-rangle layer (TYPE_GRAPHIC) for layers 0-1
     // 1024 is sufficient for small face boxes but not for full-body person boxes
     // (row-level encoding ~4 bytes/row * 1080 rows = ~4320 bytes needed)
-    int dma_size = 0x4000;  // 16KB
+    int dma_size = 0x8000;  // 32KB
     for(int layer_index = 0; layer_index < 2; layer_index++){
         osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, dma_size);sleep(0.25);
         osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma_2, dma_size);
@@ -94,26 +90,16 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         osd_layer.layerSize.layer_height = m_height;
         osd_layer.layer_rgn = {TYPE_IMAGE, {m_width, m_height}};
 
-        std::cout << "[OsdDevice] Creating layer " << layer_index << " with TYPE_IMAGE" << std::endl;
-        std::cout << "[OsdDevice] Layer region type: " << (int)osd_layer.layer_rgn.enType
-                  << " (0=TYPE_IMAGE, 1=TYPE_GRAPHIC)" << std::endl;
-        std::cout << "[OsdDevice] Layer region size: " << osd_layer.layer_rgn.size_s.w
-                  << "x" << osd_layer.layer_rgn.size_s.h << std::endl;
-
         int ret = osd_create_layer(m_osd_handle, (ssLAYER_HANDLE)layer_index, &osd_layer);
         if (ret != 0) {
             std::cerr << "[OsdDevice] ERROR: osd_create_layer failed! ret=" << ret
                       << ", layer_index=" << layer_index << std::endl;
-        } else {
-            std::cout << "[OsdDevice] Layer " << layer_index << " created successfully" << std::endl;
         }
 
         ret = osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
         if (ret != 0) {
             std::cerr << "[OsdDevice] ERROR: osd_set_layer_buffer failed! ret=" << ret
                       << ", layer_index=" << layer_index << std::endl;
-        } else {
-            std::cout << "[OsdDevice] Layer " << layer_index << " buffer set successfully" << std::endl;
         }
     }
 
@@ -146,7 +132,6 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
 
 
 void OsdDevice::Release(){
-    std::cout << "OsdDevice Release" << std::endl;
 
     // destroy layer and delete dma buf
     for(int i = 0; i < OSD_LAYER_SIZE; i++){
@@ -169,8 +154,6 @@ void OsdDevice::Release(){
 
 
 int OsdDevice::LoadLutFile(const char* filename){
-    std::cout << "[OsdDevice] Attempting to load LUT file: " << filename << std::endl;
-
     // 检查文件是否存在
     struct stat file_stat;
     if (stat(filename, &file_stat) != 0) {
@@ -184,8 +167,6 @@ int OsdDevice::LoadLutFile(const char* filename){
         std::cerr << "[OsdDevice] ERROR: Invalid file size: " << file_stat.st_size << " bytes" << std::endl;
         return -1;
     }
-
-    std::cout << "[OsdDevice] File exists, size: " << file_stat.st_size << " bytes" << std::endl;
 
     // 检查文件权限
     if (access(filename, R_OK) != 0) {
@@ -226,9 +207,6 @@ int OsdDevice::LoadLutFile(const char* filename){
     }
 
     file.close();
-
-    std::cout << "[OsdDevice] Successfully loaded LUT file: " << filename
-              << ", size: " << m_file_size << " bytes" << std::endl;
     return 0;
 }
 
@@ -281,6 +259,7 @@ void OsdDevice::Draw(std::vector<std::array<float, 4>>& boxes, int border, int l
         return;
     }
 
+    osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
     int ret = 0;
     // generate qrangle box
     for (auto &box : boxes){

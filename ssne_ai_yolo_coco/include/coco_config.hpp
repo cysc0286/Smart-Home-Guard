@@ -17,7 +17,7 @@ static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco.m1mode
 static const int   kNumClasses      = 80;
 static const int   kRegMax          = 16;   // YOLOv8 DFL bins
 static const int   kNumHeads        = 6;    // P3_box,P3_cls,P4_box,P4_cls,P5_box,P5_cls
-static const float kConfThreshold   = 0.45f;
+static const float kConfThreshold   = 0.3f;
 static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 
