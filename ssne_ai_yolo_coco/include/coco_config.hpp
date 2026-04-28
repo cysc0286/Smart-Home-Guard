@@ -13,6 +13,16 @@ static const std::array<int, 2> kDetShape    = {640, 640};
 // Model path on the board filesystem
 static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco.m1model";
 
+// Snapshot service for the PC-side zone planner.
+static const int   kSnapshotHttpPort      = 8081;
+static const int   kSnapshotUpdateIntervalMs = 500;
+static const char* kSnapshotRoute         = "/?action=snapshot";
+static const char* kSnapshotAltRoute      = "/latest_snapshot.pgm";
+static const char* kSnapshotFilePath      = "/app_demo/latest_snapshot.pgm";
+static const char* kZoneConfigPath        = "/app_demo/zone_config.json";
+static const int   kSerialPreviewWidth    = 192;
+static const int   kSerialPreviewHeight   = 144;
+
 // Detection parameters
 static const int   kNumClasses      = 80;
 static const int   kRegMax          = 16;   // YOLOv8 DFL bins

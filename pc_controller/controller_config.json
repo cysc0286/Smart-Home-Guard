@@ -1,0 +1,21 @@
+{
+  "snapshot_source": "serial",
+  "snapshot_url": "http://192.168.1.88:8081/?action=snapshot",
+  "snapshot_file": "latest_snapshot.pgm",
+  "serial_port": "COM10",
+  "serial_baudrate": 115200,
+  "serial_timeout_sec": 10.0,
+  "board_ip": "192.168.1.88",
+  "board_port": 9000,
+  "zone_file": "zone_config.json",
+  "auto_send": false,
+  "auto_refresh_after_send": false,
+  "auto_refresh_snapshot": false,
+  "snapshot_refresh_interval_ms": 500,
+  "startup_retry": 5,
+  "startup_retry_interval": 1.0,
+  "snapshot_timeout_sec": 3.0,
+  "tcp_timeout_sec": 1.5,
+  "window_width": 1280,
+  "window_height": 720
+}
