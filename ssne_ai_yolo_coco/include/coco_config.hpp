@@ -22,6 +22,7 @@ static const char* kSnapshotFilePath      = "/app_demo/latest_snapshot.pgm";
 static const char* kZoneConfigPath        = "/app_demo/zone_config.json";
 static const int   kSerialPreviewWidth    = 192;
 static const int   kSerialPreviewHeight   = 144;
+static const bool  kEnableSerialSetup     = false;
 
 // Detection parameters
 static const int   kNumClasses      = 80;

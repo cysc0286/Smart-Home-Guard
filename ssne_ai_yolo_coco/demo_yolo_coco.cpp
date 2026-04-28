@@ -3,6 +3,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cstdint>
 #include <unistd.h>
 #include <chrono>
 #include <cstring>
@@ -16,6 +17,8 @@
 #include <sys/socket.h>
 
 #include "include/gpio_alarm_controller.hpp"
+
+#include "uart_api.h"
 
 #include "include/coco_config.hpp"
 #include "include/coco_detector.hpp"
@@ -49,6 +52,92 @@ struct RectZone {
     if (x1 > x2) std::swap(x1, x2);
     if (y1 > y2) std::swap(y1, y2);
   }
+};
+
+class UartControlChannel {
+ public:
+  UartControlChannel() = default;
+
+  bool Initialize(uint32_t baudrate) {
+    handle_ = uart_init();
+    if (handle_ == NULL) {
+      fprintf(stderr, "[UART] uart_init failed\n");
+      return false;
+    }
+
+    uart_set_baudrate(handle_, UART_TX0, baudrate);
+    uart_set_baudrate(handle_, UART_RX0, baudrate);
+    uart_set_parity(handle_, UART_TX0, UART_PARITY_NONE);
+    uart_set_parity(handle_, UART_RX0, UART_PARITY_NONE);
+    printf("[UART] Ready at %u baud\n", baudrate);
+    return true;
+  }
+
+  void Release() {
+    if (handle_ != NULL) {
+      uart_close(handle_);
+      handle_ = NULL;
+    }
+  }
+
+  bool SendTextLine(const std::string& line) {
+    std::string payload = line;
+    payload.push_back('\n');
+    return SendBytes(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+  }
+
+  bool SendBytes(const uint8_t* data, size_t len) {
+    if (handle_ == NULL) {
+      return false;
+    }
+
+    size_t offset = 0;
+    while (offset < len) {
+      const uint32_t chunk =
+          static_cast<uint32_t>(std::min<size_t>(len - offset, static_cast<size_t>(32)));
+      uart_send_data(handle_, UART_TX0, const_cast<uint8_t*>(data + offset), chunk);
+      offset += chunk;
+    }
+    return true;
+  }
+
+  bool ReceiveLine(std::string* out_line, int timeout_ms) {
+    if (handle_ == NULL) {
+      return false;
+    }
+
+    std::string line;
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+      uint8_t buffer[32] = {0};
+      uint32_t actual_len = 0;
+      uart_receive_data(handle_, UART_RX0, buffer, sizeof(buffer), &actual_len);
+      if (actual_len > 0) {
+        for (uint32_t i = 0; i < actual_len; ++i) {
+          const char ch = static_cast<char>(buffer[i]);
+          if (ch == '\r') {
+            continue;
+          }
+          if (ch == '\n') {
+            *out_line = line;
+            return true;
+          }
+          line.push_back(ch);
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      const auto elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+      if (elapsed_ms >= timeout_ms) {
+        return false;
+      }
+      usleep(2000);
+    }
+  }
+
+ private:
+  uart_handle_t handle_ = NULL;
 };
 
 class SnapshotHttpServer {
@@ -372,13 +461,8 @@ bool SaveSnapshotToFile(const std::vector<unsigned char>& pgm, const char* path)
   return std::rename(temp_path.c_str(), path) == 0;
 }
 
-bool SendAllStdout(const char* data, size_t len) {
-  std::cout.write(data, static_cast<std::streamsize>(len));
-  std::cout.flush();
-  return static_cast<bool>(std::cout);
-}
-
-bool RunSerialSetup(IMAGEPROCESSOR* processor,
+bool RunSerialSetup(UartControlChannel* uart,
+                    IMAGEPROCESSOR* processor,
                     const std::array<int, 2>& crop_shape,
                     RectZone* zone) {
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, zone)) {
@@ -390,7 +474,10 @@ bool RunSerialSetup(IMAGEPROCESSOR* processor,
   printf("[SETUP] Waiting serial commands: SNAPSHOT | ZONE <json> | START\n");
 
   std::string line;
-  while (std::getline(std::cin, line)) {
+  while (!check_exit_flag()) {
+    if (!uart->ReceiveLine(&line, 200)) {
+      continue;
+    }
     if (line == "SNAPSHOT") {
       ssne_tensor_t img_sensor;
       processor->GetImage(&img_sensor);
@@ -402,35 +489,30 @@ bool RunSerialSetup(IMAGEPROCESSOR* processor,
                            std::to_string(crop_shape[0]) + " " +
                            std::to_string(crop_shape[1]) + " " +
                            std::to_string(preview.size()) + "\n";
-      if (!SendAllStdout(header.c_str(), header.size()) ||
-          !SendAllStdout(reinterpret_cast<const char*>(preview.data()), preview.size())) {
-        fprintf(stderr, "[SETUP] Failed to send snapshot over serial\n");
+      if (!uart->SendBytes(reinterpret_cast<const uint8_t*>(header.data()), header.size()) ||
+          !uart->SendBytes(preview.data(), preview.size())) {
+        fprintf(stderr, "[SETUP] Failed to send snapshot over UART\n");
         return false;
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
       RectZone parsed;
       if (!ParseRectZoneJson(line.substr(5), &parsed)) {
-        printf("ERR ZONE\n");
-        fflush(stdout);
+        uart->SendTextLine("ERR ZONE");
         continue;
       }
       if (!SaveZoneToFile(parsed, coco_config::kZoneConfigPath)) {
-        printf("ERR SAVE\n");
-        fflush(stdout);
+        uart->SendTextLine("ERR SAVE");
         continue;
       }
       *zone = parsed;
-      printf("OK ZONE\n");
-      fflush(stdout);
+      uart->SendTextLine("OK ZONE");
     } else if (line == "START") {
-      printf("OK START\n");
-      fflush(stdout);
+      uart->SendTextLine("OK START");
       return true;
     } else if (line == "QUIT") {
       return false;
     } else if (!line.empty()) {
-      printf("ERR CMD\n");
-      fflush(stdout);
+      uart->SendTextLine("ERR CMD");
     }
   }
   return false;
@@ -476,17 +558,40 @@ int main() {
   DebounceTracker     tracker;
   SnapshotBuffer      snapshot_buffer;
   RectZone            active_zone;
+  UartControlChannel  uart_channel;
 
-  if (!RunSerialSetup(&processor, crop_shape, &active_zone)) {
-    gpio_alarm.Release();
-    detector.Release();
-    processor.Release();
-    visualizer.Release();
-    if (ssne_release()) {
-      fprintf(stderr, "SSNE release failed!\n");
+  if (LoadZoneFromFile(coco_config::kZoneConfigPath, &active_zone)) {
+    printf("[ZONE] Loaded zone: (%d,%d)-(%d,%d)\n",
+           active_zone.x1, active_zone.y1, active_zone.x2, active_zone.y2);
+  } else {
+    printf("[ZONE] No zone config found, detections will run without zone filtering\n");
+  }
+
+  if (coco_config::kEnableSerialSetup) {
+    if (!uart_channel.Initialize(115200)) {
+      gpio_alarm.Release();
+      detector.Release();
+      processor.Release();
+      visualizer.Release();
+      if (ssne_release()) {
+        fprintf(stderr, "SSNE release failed!\n");
+        return -1;
+      }
       return -1;
     }
-    return 0;
+
+    if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone)) {
+      uart_channel.Release();
+      gpio_alarm.Release();
+      detector.Release();
+      processor.Release();
+      visualizer.Release();
+      if (ssne_release()) {
+        fprintf(stderr, "SSNE release failed!\n");
+        return -1;
+      }
+      return 0;
+    }
   }
 
   std::thread listener_thread(keyboard_listener);
@@ -557,6 +662,9 @@ int main() {
     snapshot_thread.join();
   }
 
+  if (coco_config::kEnableSerialSetup) {
+    uart_channel.Release();
+  }
   gpio_alarm.Release();
   detector.Release();
   processor.Release();

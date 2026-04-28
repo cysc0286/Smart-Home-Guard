@@ -27,6 +27,7 @@ target_link_libraries(
   ${M1_CMABUFFER_LIB}
   ${M1_OSD_LIB}
   ${M1_GPIO_LIB}
+  ${M1_UART_LIB}
   ${M1_SSZLOG_LIB}
   ${M1_ZLOG_LIB}
   ${M1_EMB_LIB}

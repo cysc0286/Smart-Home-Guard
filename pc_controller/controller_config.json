@@ -2,7 +2,7 @@
   "snapshot_source": "serial",
   "snapshot_url": "http://192.168.1.88:8081/?action=snapshot",
   "snapshot_file": "latest_snapshot.pgm",
-  "serial_port": "COM10",
+  "serial_port": "COM9",
   "serial_baudrate": 115200,
   "serial_timeout_sec": 10.0,
   "board_ip": "192.168.1.88",
