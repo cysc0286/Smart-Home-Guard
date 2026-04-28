@@ -1,0 +1,9 @@
+path: C:/Users/heh20/Desktop/datasets
+train: images/train
+val: images/val
+
+nc: 3
+names:
+  0: bending
+  1: standing
+  2: squatting

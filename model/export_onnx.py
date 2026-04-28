@@ -1,12 +1,12 @@
 """
-Export yolov8n.pt to ONNX in Head6 decoupled format.
+Export trained guard_action best.pt to ONNX in Head6 decoupled format.
 
 Output: 6 tensors in order: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls
   box shape: [1, h, w, 4*reg_max] = [1, h, w, 64]  (raw DFL logits, NO decoding)
-  cls shape: [1, h, w, nc]        = [1, h, w, 80]  (raw logits, NO sigmoid)
+  cls shape: [1, h, w, nc]        = [1, h, w, 3]   (raw logits, NO sigmoid)
+  Classes: 0=bending, 1=standing, 2=squatting
 
-This format matches the guard project's C++ post-processing (Head6 decoder).
-Upload the resulting .onnx to the 思思AI assistant to obtain yolov8n_coco.m1model.
+Upload the resulting .onnx to the 思思AI assistant to obtain guard_action.m1model.
 
 Usage:
     python export_onnx.py
@@ -17,8 +17,8 @@ import torch.nn as nn
 
 
 def export_head6(
-    model_path: str = "yolov8n.pt",
-    output_path: str = "yolov8n_coco_head6.onnx",
+    model_path: str = "runs/guard_action/weights/best.pt",
+    output_path: str = "guard_action_head6.onnx",
     imgsz: int = 640,
     opset: int = 11,
 ) -> None:
@@ -117,9 +117,9 @@ def export_head6(
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f"\n[DONE] Exported to: {output_path}  ({size_mb:.1f} MB, single file)")
-    print("Next: upload this .onnx to 思思AI assistant to get yolov8n_coco.m1model")
+    print("Next: upload this .onnx to 思思AI assistant to get guard_action.m1model")
     print("Then place the .m1model into:")
-    print("  ssne_ai_yolo_coco/app_assets/models/yolov8n_coco.m1model")
+    print("  ssne_ai_yolo_coco/app_assets/models/guard_action.m1model")
 
 
 if __name__ == "__main__":
