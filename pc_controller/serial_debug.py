@@ -133,14 +133,24 @@ def read_exact_partial(ser: serial.Serial, size: int, timeout: float) -> tuple[b
     deadline = time.monotonic() + timeout
     chunks: list[bytes] = []
     remaining = size
-    while remaining > 0:
-        if time.monotonic() >= deadline:
-            return b"".join(chunks), remaining
-        chunk = ser.read(remaining)
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        remaining -= len(chunk)
+    last_data_time = time.monotonic()
+    original_timeout = ser.timeout
+    ser.timeout = 0.05
+    try:
+        while remaining > 0:
+            now = time.monotonic()
+            if now >= deadline:
+                return b"".join(chunks), remaining
+            chunk = ser.read(remaining)
+            if not chunk:
+                if chunks and (remaining <= 128 or time.monotonic() - last_data_time >= 0.5):
+                    return b"".join(chunks), remaining
+                continue
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            last_data_time = time.monotonic()
+    finally:
+        ser.timeout = original_timeout
     return b"".join(chunks), 0
 
 

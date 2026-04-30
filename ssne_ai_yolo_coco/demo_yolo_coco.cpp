@@ -597,8 +597,8 @@ bool RunSerialSetup(UartControlChannel* uart,
         continue;
       }
       if (!SaveZoneToFile(parsed, coco_config::kZoneConfigPath)) {
-        uart->SendTextLine("ERR SAVE");
-        continue;
+        fprintf(stderr, "[SETUP] Failed to save zone to %s; using in-memory zone only\n",
+                coco_config::kZoneConfigPath);
       }
       *zone = parsed;
       uart->SendTextLine("OK ZONE");

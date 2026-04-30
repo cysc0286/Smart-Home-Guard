@@ -276,10 +276,10 @@ class SerialControlClient:
             payload = json.dumps(zone.to_dict(), ensure_ascii=False)
             ser.write(f"ZONE {payload}\n".encode("utf-8"))
             ser.flush()
-            self._wait_for_marker(ser, b"OK ZONE", timeout_sec=3.0)
+            self._try_wait_for_marker(ser, b"OK ZONE", timeout_sec=0.5)
             ser.write(b"START\n")
             ser.flush()
-            self._wait_for_marker(ser, b"OK START", timeout_sec=3.0)
+            self._try_wait_for_marker(ser, b"OK START", timeout_sec=0.5)
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -307,6 +307,13 @@ class SerialControlClient:
             ser.timeout = original_timeout
         raise RuntimeError(f"串口等待板端响应超时: {marker.decode('ascii', errors='ignore')}")
 
+    def _try_wait_for_marker(self, ser, marker: bytes, timeout_sec: float) -> bool:
+        try:
+            self._wait_for_marker(ser, marker, timeout_sec)
+            return True
+        except RuntimeError:
+            return False
+
     def _read_snapshot_header(self, ser) -> str:
         marker = b"SNAPSHOT "
         buffer = bytearray()
@@ -332,16 +339,26 @@ class SerialControlClient:
     def _read_exact(self, ser, size: int) -> bytes:
         chunks: list[bytes] = []
         remaining = size
-        while remaining > 0:
-            chunk = ser.read(remaining)
-            if not chunk:
-                received = size - remaining
-                if received > 0 and remaining <= 64:
-                    chunks.append(b"\x00" * remaining)
-                    break
-                raise RuntimeError("串口读取图片数据超时")
-            chunks.append(chunk)
-            remaining -= len(chunk)
+        last_data_time = time.monotonic()
+        original_timeout = ser.timeout
+        ser.timeout = 0.05
+        try:
+            while remaining > 0:
+                chunk = ser.read(remaining)
+                if not chunk:
+                    received = size - remaining
+                    idle_sec = time.monotonic() - last_data_time
+                    if received > 0 and (remaining <= 128 or idle_sec >= 0.5):
+                        chunks.append(b"\x00" * remaining)
+                        break
+                    if idle_sec >= self.timeout_sec:
+                        raise RuntimeError("串口读取图片数据超时")
+                    continue
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                last_data_time = time.monotonic()
+        finally:
+            ser.timeout = original_timeout
         return b"".join(chunks)
 
     def _decode_pgm(self, payload: bytes) -> np.ndarray:

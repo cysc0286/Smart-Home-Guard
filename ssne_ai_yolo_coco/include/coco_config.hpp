@@ -20,8 +20,8 @@ static const char* kSnapshotRoute         = "/?action=snapshot";
 static const char* kSnapshotAltRoute      = "/latest_snapshot.pgm";
 static const char* kSnapshotFilePath      = "/app_demo/latest_snapshot.pgm";
 static const char* kZoneConfigPath        = "/app_demo/zone_config.json";
-static const int   kSerialPreviewWidth    = 192;
-static const int   kSerialPreviewHeight   = 144;
+static const int   kSerialPreviewWidth    = 128;
+static const int   kSerialPreviewHeight   = 96;
 static const bool  kEnableSerialSetup     = true;
 static const int   kSerialBaudrate        = 115200;
 
