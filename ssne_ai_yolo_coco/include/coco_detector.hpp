@@ -12,11 +12,11 @@ class COCO_DETECTOR {
  public:
   std::string ModelName() const { return "yolov8n_coco_head6"; }
 
-  void Initialize(std::string& model_path,
+  bool Initialize(std::string& model_path,
                   std::array<int, 2>* in_img_shape,
                   std::array<int, 2>* in_det_shape);
 
-  void Predict(ssne_tensor_t* img_in,
+  bool Predict(ssne_tensor_t* img_in,
                CocoDetectionResult* result,
                float conf_threshold = coco_config::kConfThreshold);
 

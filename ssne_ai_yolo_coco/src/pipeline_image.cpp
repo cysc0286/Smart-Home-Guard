@@ -44,17 +44,13 @@ void IMAGEPROCESSOR::Initialize(std::array<int, 2>* in_img_shape)
  * @brief 从pipeline获取图像数据（裁剪图）
  * @param img_sensor 输出参数：存储从pipe0获取的裁剪图像（720×540）
  */
-void IMAGEPROCESSOR::GetImage(ssne_tensor_t* img_sensor) {
-    int capture_code = -1;  // pipe0采集返回码
-    
-    // 从pipe0获取裁剪后的图像数据
-    capture_code = GetImageData(img_sensor, kPipeline0, kSensor0, 0);
-    
-    // 检查pipe0采集是否成功
-    if (capture_code != 0)
-    {   
-        printf("[IMAGEPROCESSOR] Get Invalid Image from kPipeline0!\n");
+bool IMAGEPROCESSOR::GetImage(ssne_tensor_t* img_sensor) {
+    const int capture_code = GetImageData(img_sensor, kPipeline0, kSensor0, 0);
+    if (capture_code != 0) {
+        printf("[CAM] GetImageData failed, code=%d\n", capture_code);
+        return false;
     }
+    return true;
 }
 
 /**

@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdio>
 
-void COCO_DETECTOR::Initialize(std::string& model_path,
+bool COCO_DETECTOR::Initialize(std::string& model_path,
                                 std::array<int, 2>* in_img_shape,
                                 std::array<int, 2>* in_det_shape) {
   img_shape = *in_img_shape;
@@ -14,25 +14,27 @@ void COCO_DETECTOR::Initialize(std::string& model_path,
 
   char* model_path_char = const_cast<char*>(model_path.c_str());
   model_id = ssne_loadmodel(model_path_char, SSNE_STATIC_ALLOC);
-  printf("[INFO] Model loaded, model_id = %d\n", (int)model_id);
+  printf("[RESOURCE] ssne_loadmodel returned model_id=%d\n", (int)model_id);
 
-  // Query model's expected input dtype (SSNE_UINT8=0 / SSNE_INT8=1 / SSNE_FLOAT32=2)
+  // ssne_loadmodel returns 0 for the first model (valid). Use dtype query to verify.
   int input_dtype = SSNE_FLOAT32;
-  ssne_get_model_input_dtype(model_id, &input_dtype);
-  printf("[INFO] Model input dtype = %d (0=uint8, 1=int8, 2=float32)\n", input_dtype);
+  const int dtype_ret = ssne_get_model_input_dtype(model_id, &input_dtype);
+  if (dtype_ret != 0) {
+    fprintf(stderr, "[RESOURCE][ALARM] Model load failed! path=%s  model_id=%d  ret=%d\n",
+            model_path.c_str(), (int)model_id, dtype_ret);
+    return false;
+  }
+  printf("[RESOURCE] Model input dtype = %d (0=uint8, 1=int8, 2=float32)\n", input_dtype);
 
-  // Align preprocessing pipeline normalization to model requirements
   SetNormalize(pipe_offline, model_id);
 
   const uint32_t det_width  = static_cast<uint32_t>(det_shape[0]);
   const uint32_t det_height = static_cast<uint32_t>(det_shape[1]);
   inputs[0] = create_tensor(det_width, det_height, SSNE_RGB, SSNE_BUF_AI);
-  // Set tensor dtype to match model expectation to avoid "Wrong input tensor!" error
   set_data_type(inputs[0], static_cast<uint8_t>(input_dtype));
 
-  printf("[INFO] COCO_DETECTOR initialized with input shape [%d, %d]\n",
-         det_shape[0], det_shape[1]);
-  printf("[INFO] Expect Head6 outputs: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls\n");
+  printf("[RESOURCE] COCO_DETECTOR ready, input=[%d,%d]\n", det_shape[0], det_shape[1]);
+  return true;
 }
 
 float COCO_DETECTOR::Sigmoid(float x) const {
@@ -159,20 +161,21 @@ void COCO_DETECTOR::ApplyNms(std::vector<CocoDetection>* detections) const {
   detections->swap(kept);
 }
 
-void COCO_DETECTOR::Predict(ssne_tensor_t* img_in,
+bool COCO_DETECTOR::Predict(ssne_tensor_t* img_in,
                              CocoDetectionResult* result,
                              float conf_threshold) {
   result->Clear();
 
-  const int ret = RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0]);
-  if (ret != 0) {
-    printf("[ERROR] Failed to run AI preprocess pipe: %d\n", ret);
-    return;
+  const int preproc_ret = RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0]);
+  if (preproc_ret != 0) {
+    fprintf(stderr, "[INFER][ALARM] Preprocess pipe failed, code=%d\n", preproc_ret);
+    return false;
   }
 
-  if (ssne_inference(model_id, 1, inputs)) {
-    fprintf(stderr, "ssne inference fail!\n");
-    return;
+  const int infer_ret = ssne_inference(model_id, 1, inputs);
+  if (infer_ret != 0) {
+    fprintf(stderr, "[INFER][ALARM] ssne_inference failed, code=%d\n", infer_ret);
+    return false;
   }
 
   ssne_getoutput(model_id, coco_config::kNumHeads, outputs);
@@ -194,6 +197,7 @@ void COCO_DETECTOR::Predict(ssne_tensor_t* img_in,
 
   ApplyNms(&detections);
   result->detections = detections;
+  return true;
 }
 
 void COCO_DETECTOR::Release() {

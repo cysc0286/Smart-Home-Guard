@@ -534,7 +534,12 @@ int main() {
   processor.Initialize(&img_shape);
 
   COCO_DETECTOR detector;
-  detector.Initialize(model_path, &crop_shape, &det_shape);
+  if (!detector.Initialize(model_path, &crop_shape, &det_shape)) {
+    fprintf(stderr, "[RESOURCE][ALARM] Detector init failed, aborting.\n");
+    processor.Release();
+    ssne_release();
+    return -1;
+  }
   printf("[INIT] Detector loaded: %s\n", model_path.c_str());
 
   VISUALIZER visualizer;
@@ -598,16 +603,53 @@ int main() {
   SnapshotHttpServer snapshot_server(coco_config::kSnapshotHttpPort, &snapshot_buffer);
   std::thread snapshot_thread(&SnapshotHttpServer::Run, &snapshot_server);
 
-  auto last_log_time = std::chrono::steady_clock::now();
+  auto last_log_time      = std::chrono::steady_clock::now();
   auto last_snapshot_time = std::chrono::steady_clock::now() -
                             std::chrono::milliseconds(coco_config::kSnapshotUpdateIntervalMs);
-  constexpr int kDetLogIntervalMs  = 500;
-  constexpr int kIdleLogIntervalMs = 5000;
+  auto fps_window_start   = std::chrono::steady_clock::now();
+  constexpr int kDetLogIntervalMs   = 500;
+  constexpr int kIdleLogIntervalMs  = 5000;
+  constexpr int kFpsLogIntervalMs   = 1000;
+  constexpr float kSensorFps        = 60.0f;
+  constexpr int kCamFailMax         = 60;  // ~1s of consecutive camera failures
+  constexpr int kInferFailMax       = 30;  // ~0.5s of consecutive inference failures
+
+  int fps_frame_count   = 0;
+  int cam_fail_count    = 0;
+  int infer_fail_count  = 0;
 
   while (!check_exit_flag()) {
-    processor.GetImage(&img_sensor);
-
     const auto now = std::chrono::steady_clock::now();
+
+    // --- 摄像头异常处理 ---
+    if (!processor.GetImage(&img_sensor)) {
+      ++cam_fail_count;
+      if (cam_fail_count == 1) {
+        fprintf(stderr, "[CAM][ALARM] Camera frame acquisition failed\n");
+      }
+      if (cam_fail_count >= kCamFailMax) {
+        fprintf(stderr, "[CAM][ALARM] Camera unresponsive for %d frames, attempting pipeline restart\n",
+                cam_fail_count);
+        processor.Release();
+        usleep(200000);
+        processor.Initialize(&img_shape);
+        cam_fail_count = 0;
+      }
+      continue;
+    }
+    cam_fail_count = 0;
+
+    ++fps_frame_count;
+    const auto fps_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - fps_window_start).count();
+    if (fps_elapsed_ms >= kFpsLogIntervalMs) {
+      const float fps_app = fps_frame_count * 1000.0f / static_cast<float>(fps_elapsed_ms);
+      const float ratio   = fps_app / kSensorFps;
+      printf("[FPS]  app=%.1f  sensor=%.0f  R=%.2f\n", fps_app, kSensorFps, ratio);
+      fps_frame_count  = 0;
+      fps_window_start = now;
+    }
+
     const auto snapshot_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_snapshot_time).count();
     if (snapshot_elapsed_ms >= coco_config::kSnapshotUpdateIntervalMs) {
@@ -615,9 +657,9 @@ int main() {
       {
         std::lock_guard<std::mutex> lock(snapshot_buffer.mutex);
         snapshot_buffer.pgm_bytes = pgm;
-        snapshot_buffer.width = crop_shape[0];
+        snapshot_buffer.width  = crop_shape[0];
         snapshot_buffer.height = crop_shape[1];
-        snapshot_buffer.ready = true;
+        snapshot_buffer.ready  = true;
       }
       if (!SaveSnapshotToFile(pgm, coco_config::kSnapshotFilePath)) {
         printf("[SNAPSHOT] failed to save %s\n", coco_config::kSnapshotFilePath);
@@ -625,11 +667,21 @@ int main() {
       last_snapshot_time = now;
     }
 
-    detector.Predict(&img_sensor, &det_result, coco_config::kConfThreshold);
+    // --- 推理异常处理 ---
+    if (!detector.Predict(&img_sensor, &det_result, coco_config::kConfThreshold)) {
+      ++infer_fail_count;
+      fprintf(stderr, "[INFER][ALARM] Inference failed (%d consecutive)\n", infer_fail_count);
+      if (infer_fail_count >= kInferFailMax) {
+        fprintf(stderr, "[INFER][ALARM] Too many inference failures, skipping OSD this cycle\n");
+      }
+      visualizer.Draw({});
+      continue;
+    }
+    infer_fail_count = 0;
+
     FilterDetectionsByZone(&det_result, active_zone);
     ConvertCropBoxesToOriginal(&det_result);
 
-    // Debounce: only show detections stable across >= 3 consecutive frames
     tracker.Update(det_result);
     CocoDetectionResult stable = tracker.ConfirmedDetections();
 

@@ -68,7 +68,7 @@ class IMAGEPROCESSOR {
      * 
      * \param[in] img_sensor // 输出图像, 3-D array with layout HWC, SSNE_Y_8 format。
     */
-    void GetImage(ssne_tensor_t* img_sensor);
+    bool GetImage(ssne_tensor_t* img_sensor);
     
     /*
      * 对检测坐标进行后处理，还原缩放和padding导致的坐标变化。
