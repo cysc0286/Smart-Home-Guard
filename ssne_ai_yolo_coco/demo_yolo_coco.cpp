@@ -18,11 +18,10 @@
 
 #include "include/gpio_alarm_controller.hpp"
 
-#include "uart_api.h"
-
 #include "include/coco_config.hpp"
 #include "include/coco_detector.hpp"
 #include "include/debounce_tracker.hpp"
+#include "include/uart_control_channel.hpp"
 #include "include/utils.hpp"
 #include "include/common.hpp"
 
@@ -52,92 +51,6 @@ struct RectZone {
     if (x1 > x2) std::swap(x1, x2);
     if (y1 > y2) std::swap(y1, y2);
   }
-};
-
-class UartControlChannel {
- public:
-  UartControlChannel() = default;
-
-  bool Initialize(uint32_t baudrate) {
-    handle_ = uart_init();
-    if (handle_ == NULL) {
-      fprintf(stderr, "[UART] uart_init failed\n");
-      return false;
-    }
-
-    uart_set_baudrate(handle_, UART_TX0, baudrate);
-    uart_set_baudrate(handle_, UART_RX0, baudrate);
-    uart_set_parity(handle_, UART_TX0, UART_PARITY_NONE);
-    uart_set_parity(handle_, UART_RX0, UART_PARITY_NONE);
-    printf("[UART] Ready at %u baud\n", baudrate);
-    return true;
-  }
-
-  void Release() {
-    if (handle_ != NULL) {
-      uart_close(handle_);
-      handle_ = NULL;
-    }
-  }
-
-  bool SendTextLine(const std::string& line) {
-    std::string payload = line;
-    payload.push_back('\n');
-    return SendBytes(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-  }
-
-  bool SendBytes(const uint8_t* data, size_t len) {
-    if (handle_ == NULL) {
-      return false;
-    }
-
-    size_t offset = 0;
-    while (offset < len) {
-      const uint32_t chunk =
-          static_cast<uint32_t>(std::min<size_t>(len - offset, static_cast<size_t>(32)));
-      uart_send_data(handle_, UART_TX0, const_cast<uint8_t*>(data + offset), chunk);
-      offset += chunk;
-    }
-    return true;
-  }
-
-  bool ReceiveLine(std::string* out_line, int timeout_ms) {
-    if (handle_ == NULL) {
-      return false;
-    }
-
-    std::string line;
-    auto start = std::chrono::steady_clock::now();
-    while (true) {
-      uint8_t buffer[32] = {0};
-      uint32_t actual_len = 0;
-      uart_receive_data(handle_, UART_RX0, buffer, sizeof(buffer), &actual_len);
-      if (actual_len > 0) {
-        for (uint32_t i = 0; i < actual_len; ++i) {
-          const char ch = static_cast<char>(buffer[i]);
-          if (ch == '\r') {
-            continue;
-          }
-          if (ch == '\n') {
-            *out_line = line;
-            return true;
-          }
-          line.push_back(ch);
-        }
-      }
-
-      const auto now = std::chrono::steady_clock::now();
-      const auto elapsed_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (elapsed_ms >= timeout_ms) {
-        return false;
-      }
-      usleep(2000);
-    }
-  }
-
- private:
-  uart_handle_t handle_ = NULL;
 };
 
 class SnapshotHttpServer {
@@ -573,7 +486,7 @@ int main() {
   }
 
   if (coco_config::kEnableSerialSetup) {
-    if (!uart_channel.Initialize(115200)) {
+    if (!uart_channel.Initialize(coco_config::kSerialBaudrate)) {
       gpio_alarm.Release();
       detector.Release();
       processor.Release();

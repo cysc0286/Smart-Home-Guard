@@ -175,6 +175,9 @@ def resolve_config_path(raw_path: str, config_dir: Path) -> Path:
 
 
 class ZoneSender(Protocol):
+    def display_target(self) -> str:
+        ...
+
     def send(self, zone: RectZone) -> None:
         ...
 
@@ -191,6 +194,9 @@ class TcpZoneSender:
             (self.board_ip, self.board_port), timeout=self.timeout_sec
         ) as conn:
             conn.sendall(payload)
+
+    def display_target(self) -> str:
+        return f"{self.board_ip}:{self.board_port}"
 
 
 class SnapshotClient(Protocol):
@@ -280,6 +286,9 @@ class SerialControlClient:
             ser.write(b"START\n")
             ser.flush()
             self._wait_for_prefix(ser, "OK START")
+
+    def display_target(self) -> str:
+        return f"{self.port}@{self.baudrate}"
 
     def _open_serial(self):
         return serial.Serial(self.port, self.baudrate, timeout=self.timeout_sec)
@@ -518,7 +527,7 @@ class ZoneDrawerApp:
 
         z = self.current_zone.normalized()
         self.last_status = (
-            f"已发送到板端 {self.sender.board_ip}:{self.sender.board_port} -> "
+            f"已发送到板端 {self.sender.display_target()} -> "
             f"({z.x1},{z.y1})-({z.x2},{z.y2})"
         )
         if self.auto_refresh_after_send:
