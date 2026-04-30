@@ -317,9 +317,9 @@ std::vector<unsigned char> BuildPgmSnapshot(const ssne_tensor_t& img_sensor,
   std::vector<unsigned char> pgm(header.begin(), header.end());
   pgm.reserve(header.size() + width * height);
 
-  // Online pipeline outputs YUV422 16-bit packed data. Luma bytes are every even byte.
+  // SSNE_YUV422_16 is packed as UYVY on this pipeline; luma is the odd byte.
   for (int i = 0; i < width * height; ++i) {
-    pgm.push_back(src[i * 2]);
+    pgm.push_back(src[i * 2 + 1]);
   }
   return pgm;
 }
@@ -343,10 +343,67 @@ std::vector<unsigned char> BuildPreviewPgm(const ssne_tensor_t& img_sensor,
     for (int x = 0; x < preview_width; ++x) {
       const int src_x = x * source_width / preview_width;
       const int pixel_index = src_y * source_width + src_x;
-      pgm.push_back(src[pixel_index * 2]);
+      pgm.push_back(src[pixel_index * 2 + 1]);
     }
   }
   return pgm;
+}
+
+static unsigned char ClampToByte(int value) {
+  if (value < 0) return 0;
+  if (value > 255) return 255;
+  return static_cast<unsigned char>(value);
+}
+
+static void YuvToRgb(int y, int u, int v,
+                     unsigned char* r,
+                     unsigned char* g,
+                     unsigned char* b) {
+  const int c = y - 16;
+  const int d = u - 128;
+  const int e = v - 128;
+  *r = ClampToByte((298 * c + 409 * e + 128) >> 8);
+  *g = ClampToByte((298 * c - 100 * d - 208 * e + 128) >> 8);
+  *b = ClampToByte((298 * c + 516 * d + 128) >> 8);
+}
+
+std::vector<unsigned char> BuildPreviewPpm(const ssne_tensor_t& img_sensor,
+                                           const std::array<int, 2>& crop_shape,
+                                           int preview_width,
+                                           int preview_height) {
+  const unsigned char* src =
+      static_cast<const unsigned char*>(get_data(const_cast<ssne_tensor_t&>(img_sensor)));
+  const int source_width = crop_shape[0];
+  const int source_height = crop_shape[1];
+
+  std::string header = "P6\n" + std::to_string(preview_width) + " " +
+                       std::to_string(preview_height) + "\n255\n";
+  std::vector<unsigned char> ppm(header.begin(), header.end());
+  ppm.reserve(header.size() + preview_width * preview_height * 3);
+
+  for (int y = 0; y < preview_height; ++y) {
+    const int src_y = y * source_height / preview_height;
+    for (int x = 0; x < preview_width; ++x) {
+      const int src_x = x * source_width / preview_width;
+      const int pair_x = src_x & ~1;
+      const int pair_index = src_y * source_width + pair_x;
+      const unsigned char* pair = src + pair_index * 2;
+
+      // UYVY byte order: U0 Y0 V0 Y1. Adjacent pixels share U/V.
+      const int u_value = pair[0];
+      const int y_value = (src_x & 1) ? pair[3] : pair[1];
+      const int v_value = pair[2];
+
+      unsigned char r;
+      unsigned char g;
+      unsigned char b;
+      YuvToRgb(y_value, u_value, v_value, &r, &g, &b);
+      ppm.push_back(r);
+      ppm.push_back(g);
+      ppm.push_back(b);
+    }
+  }
+  return ppm;
 }
 
 void UpdateSnapshotBuffer(const ssne_tensor_t& img_sensor,
@@ -394,7 +451,7 @@ bool RunSerialSetup(UartControlChannel* uart,
     if (line == "SNAPSHOT") {
       ssne_tensor_t img_sensor;
       processor->GetImage(&img_sensor);
-      std::vector<unsigned char> preview = BuildPreviewPgm(
+      std::vector<unsigned char> preview = BuildPreviewPpm(
           img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
       std::string header = "SNAPSHOT " +
                            std::to_string(coco_config::kSerialPreviewWidth) + " " +

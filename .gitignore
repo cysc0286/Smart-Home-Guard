@@ -4,3 +4,4 @@
 model/runs/
 __pycache__/
 *.pyc
+pc_controller/debug_snapshot.pgm

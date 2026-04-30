@@ -251,30 +251,24 @@ class SerialControlClient:
             ser.reset_input_buffer()
             ser.write(b"SNAPSHOT\n")
             ser.flush()
-            while True:
-                line = ser.readline()
-                if not line:
-                    raise RuntimeError("串口快照超时，未收到板端响应")
-                text = line.decode("utf-8", errors="ignore").strip()
-                if not text.startswith("SNAPSHOT "):
-                    continue
-                parts = text.split()
-                if len(parts) != 6:
-                    raise RuntimeError(f"板端快照头格式错误: {text}")
-                preview_width = int(parts[1])
-                preview_height = int(parts[2])
-                logical_width = int(parts[3])
-                logical_height = int(parts[4])
-                payload_size = int(parts[5])
-                payload = self._read_exact(ser, payload_size)
-                frame = self._decode_pgm(payload)
-                if frame.shape[1] != preview_width or frame.shape[0] != preview_height:
-                    raise RuntimeError("板端快照尺寸与头信息不一致")
-                return SnapshotFrame(
-                    image=frame,
-                    logical_width=logical_width,
-                    logical_height=logical_height,
-                )
+            header = self._read_snapshot_header(ser)
+            parts = header.split()
+            if len(parts) != 6:
+                raise RuntimeError(f"板端快照头格式错误: {header}")
+            preview_width = int(parts[1])
+            preview_height = int(parts[2])
+            logical_width = int(parts[3])
+            logical_height = int(parts[4])
+            payload_size = int(parts[5])
+            payload = self._read_exact(ser, payload_size)
+            frame = self._decode_pgm(payload)
+            if frame.shape[1] != preview_width or frame.shape[0] != preview_height:
+                raise RuntimeError("板端快照尺寸与头信息不一致")
+            return SnapshotFrame(
+                image=frame,
+                logical_width=logical_width,
+                logical_height=logical_height,
+            )
 
     def send(self, zone: RectZone) -> None:
         with self._open_serial() as ser:
@@ -299,8 +293,30 @@ class SerialControlClient:
             if not line:
                 raise RuntimeError(f"串口等待板端响应超时: {prefix}")
             text = line.decode("utf-8", errors="ignore").strip()
-            if text.startswith(prefix):
+            if prefix in text:
                 return
+
+    def _read_snapshot_header(self, ser) -> str:
+        marker = b"SNAPSHOT "
+        buffer = bytearray()
+        max_scan_bytes = 8192
+        while len(buffer) < max_scan_bytes:
+            chunk = ser.read(1)
+            if not chunk:
+                raise RuntimeError("串口快照超时，未收到板端 SNAPSHOT 响应")
+            buffer.extend(chunk)
+            marker_pos = buffer.find(marker)
+            if marker_pos < 0:
+                if len(buffer) > len(marker):
+                    del buffer[:-len(marker)]
+                continue
+
+            line_end = buffer.find(b"\n", marker_pos)
+            if line_end >= 0:
+                raw_header = bytes(buffer[marker_pos:line_end])
+                return raw_header.decode("utf-8", errors="strict").strip()
+
+        raise RuntimeError("串口快照响应中未找到 SNAPSHOT 头")
 
     def _read_exact(self, ser, size: int) -> bytes:
         chunks: list[bytes] = []
@@ -308,6 +324,10 @@ class SerialControlClient:
         while remaining > 0:
             chunk = ser.read(remaining)
             if not chunk:
+                received = size - remaining
+                if received > 0 and remaining <= 64:
+                    chunks.append(b"\x00" * remaining)
+                    break
                 raise RuntimeError("串口读取图片数据超时")
             chunks.append(chunk)
             remaining -= len(chunk)
@@ -356,7 +376,7 @@ class ZoneDrawerApp:
         self.drag_start: tuple[int, int] | None = None
         self.preview_zone: RectZone | None = None
         self.current_zone: RectZone | None = self._load_zone()
-        self.last_status = "启动中，正在请求板端快照..."
+        self.last_status = "Starting: fetching board snapshot..."
 
     def _load_zone(self) -> RectZone | None:
         if not self.zone_file.exists():
@@ -408,17 +428,48 @@ class ZoneDrawerApp:
         try:
             frame = self.snapshot_client.fetch()
         except (URLError, HTTPError, OSError, RuntimeError) as exc:
-            self.last_status = f"快照获取失败: {exc}"
+            self.last_status = f"Snapshot failed: {exc}"
             return False
-        self.current_image = frame.image
+        self.current_image = self._prepare_display_image(frame.image)
         self.logical_width = frame.logical_width
         self.logical_height = frame.logical_height
         h, w = self.current_image.shape[:2]
         self.last_snapshot_fetch_monotonic = time.monotonic()
         self.last_status = (
-            f"快照获取成功: 预览 {w}x{h} | 逻辑坐标 {self.logical_width}x{self.logical_height}"
+            f"Snapshot OK: preview {w}x{h} | logical {self.logical_width}x{self.logical_height}"
         )
         return True
+
+    def _prepare_display_image(self, image: np.ndarray) -> np.ndarray:
+        display = image
+        if display.ndim == 2:
+            gray = display
+            min_val = int(gray.min())
+            max_val = int(gray.max())
+            if max_val > min_val:
+                gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        elif display.shape[2] == 1:
+            gray = display[:, :, 0]
+            min_val = int(gray.min())
+            max_val = int(gray.max())
+            if max_val > min_val:
+                gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        else:
+            display = display.copy()
+
+        source_h, source_w = display.shape[:2]
+        scale = min(
+            self.window_width / max(source_w, 1),
+            self.window_height / max(source_h, 1),
+        )
+        scale = max(scale, 1.0)
+        target_w = max(1, int(round(source_w * scale)))
+        target_h = max(1, int(round(source_h * scale)))
+        if target_w != source_w or target_h != source_h:
+            display = cv2.resize(display, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        return display
 
     def _fetch_snapshot_with_retry(self) -> bool:
         for attempt in range(1, self.startup_retry + 1):
@@ -511,23 +562,23 @@ class ZoneDrawerApp:
             self.drag_start = None
             self._save_zone(self.current_zone)
             z = self.current_zone
-            self.last_status = f"禁区已设定: ({z.x1},{z.y1})-({z.x2},{z.y2})"
+            self.last_status = f"Zone set: ({z.x1},{z.y1})-({z.x2},{z.y2})"
             if self.auto_send:
                 self._send_zone()
 
     def _send_zone(self) -> None:
         if self.current_zone is None:
-            self.last_status = "当前没有禁区，请先画框"
+            self.last_status = "No zone selected"
             return
         try:
             self.sender.send(self.current_zone)
         except OSError as exc:
-            self.last_status = f"发送失败: {exc}"
+            self.last_status = f"Send failed: {exc}"
             return
 
         z = self.current_zone.normalized()
         self.last_status = (
-            f"已发送到板端 {self.sender.display_target()} -> "
+            f"Sent to board {self.sender.display_target()} -> "
             f"({z.x1},{z.y1})-({z.x2},{z.y2})"
         )
         if self.auto_refresh_after_send:
@@ -538,7 +589,7 @@ class ZoneDrawerApp:
         self.preview_zone = None
         self.drag_start = None
         self._save_zone(None)
-        self.last_status = "禁区已清除"
+        self.last_status = "Zone cleared"
 
     def _maybe_auto_refresh_snapshot(self) -> None:
         if not self.auto_refresh_snapshot or self.dragging:

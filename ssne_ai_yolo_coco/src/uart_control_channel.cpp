@@ -62,6 +62,7 @@ bool UartControlChannel::SendBytes(const uint8_t* data, size_t len) {
         std::min<size_t>(len - offset, static_cast<size_t>(kFifoBytes)));
     uart_send_data(handle_, UART_TX0, const_cast<uint8_t*>(data + offset), chunk);
     offset += chunk;
+    usleep(kTxChunkGapUs);
   }
   return true;
 }
