@@ -276,10 +276,10 @@ class SerialControlClient:
             payload = json.dumps(zone.to_dict(), ensure_ascii=False)
             ser.write(f"ZONE {payload}\n".encode("utf-8"))
             ser.flush()
-            self._wait_for_prefix(ser, "OK ZONE")
+            self._wait_for_marker(ser, b"OK ZONE", timeout_sec=3.0)
             ser.write(b"START\n")
             ser.flush()
-            self._wait_for_prefix(ser, "OK START")
+            self._wait_for_marker(ser, b"OK START", timeout_sec=3.0)
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -287,14 +287,25 @@ class SerialControlClient:
     def _open_serial(self):
         return serial.Serial(self.port, self.baudrate, timeout=self.timeout_sec)
 
-    def _wait_for_prefix(self, ser, prefix: str) -> None:
-        while True:
-            line = ser.readline()
-            if not line:
-                raise RuntimeError(f"串口等待板端响应超时: {prefix}")
-            text = line.decode("utf-8", errors="ignore").strip()
-            if prefix in text:
-                return
+    def _wait_for_marker(self, ser, marker: bytes, timeout_sec: float) -> None:
+        buffer = bytearray()
+        deadline = time.monotonic() + timeout_sec
+        max_scan_bytes = 8192
+        original_timeout = ser.timeout
+        ser.timeout = 0.1
+        try:
+            while time.monotonic() < deadline:
+                chunk = ser.read(64)
+                if not chunk:
+                    continue
+                buffer.extend(chunk)
+                if marker in buffer:
+                    return
+                if len(buffer) > max_scan_bytes:
+                    del buffer[:-len(marker)]
+        finally:
+            ser.timeout = original_timeout
+        raise RuntimeError(f"串口等待板端响应超时: {marker.decode('ascii', errors='ignore')}")
 
     def _read_snapshot_header(self, ser) -> str:
         marker = b"SNAPSHOT "
@@ -334,11 +345,77 @@ class SerialControlClient:
         return b"".join(chunks)
 
     def _decode_pgm(self, payload: bytes) -> np.ndarray:
+        if payload.startswith(b"qoif"):
+            return self._decode_qoi(payload)
         arr = np.frombuffer(payload, dtype=np.uint8)
         image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError("无法解码板端返回的串口快照")
         return image
+
+    def _decode_qoi(self, payload: bytes) -> np.ndarray:
+        if len(payload) < 22 or payload[:4] != b"qoif":
+            raise RuntimeError("QOI 快照格式错误")
+        width = int.from_bytes(payload[4:8], "big")
+        height = int.from_bytes(payload[8:12], "big")
+        channels = payload[12]
+        if channels not in (3, 4):
+            raise RuntimeError(f"不支持的 QOI 通道数: {channels}")
+
+        index = [(0, 0, 0, 0)] * 64
+        r = g = b = 0
+        a = 255
+        pixels: list[tuple[int, int, int]] = []
+        pos = 14
+        total_pixels = width * height
+
+        while len(pixels) < total_pixels and pos < len(payload) - 8:
+            byte = payload[pos]
+            pos += 1
+
+            if byte == 0xFE:
+                if pos + 3 > len(payload):
+                    break
+                r, g, b = payload[pos], payload[pos + 1], payload[pos + 2]
+                pos += 3
+            elif byte == 0xFF:
+                if pos + 4 > len(payload):
+                    break
+                r, g, b, a = payload[pos], payload[pos + 1], payload[pos + 2], payload[pos + 3]
+                pos += 4
+            else:
+                tag = byte & 0xC0
+                if tag == 0x00:
+                    r, g, b, a = index[byte]
+                elif tag == 0x40:
+                    r = (r + ((byte >> 4) & 0x03) - 2) & 0xFF
+                    g = (g + ((byte >> 2) & 0x03) - 2) & 0xFF
+                    b = (b + (byte & 0x03) - 2) & 0xFF
+                elif tag == 0x80:
+                    if pos >= len(payload):
+                        break
+                    byte2 = payload[pos]
+                    pos += 1
+                    dg = (byte & 0x3F) - 32
+                    dr_dg = ((byte2 >> 4) & 0x0F) - 8
+                    db_dg = (byte2 & 0x0F) - 8
+                    r = (r + dg + dr_dg) & 0xFF
+                    g = (g + dg) & 0xFF
+                    b = (b + dg + db_dg) & 0xFF
+                else:
+                    run = byte & 0x3F
+                    for _ in range(run + 1):
+                        pixels.append((b, g, r))
+                    continue
+
+            index_pos = (r * 3 + g * 5 + b * 7 + a * 11) % 64
+            index[index_pos] = (r, g, b, a)
+            pixels.append((b, g, r))
+
+        if len(pixels) < total_pixels:
+            pixels.extend([(0, 0, 0)] * (total_pixels - len(pixels)))
+        arr = np.array(pixels[:total_pixels], dtype=np.uint8).reshape((height, width, 3))
+        return arr
 
 
 class ZoneDrawerApp:

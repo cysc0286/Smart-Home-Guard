@@ -26,7 +26,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--save-snapshot",
-        default="debug_snapshot.pgm",
+        default="debug_snapshot.qoi",
         help="When command is SNAPSHOT, save the returned image payload to this file.",
     )
     args = parser.parse_args()
@@ -117,8 +117,12 @@ def read_snapshot(ser: serial.Serial, output_path: Path, timeout: float) -> int:
             print("payload looks like a valid PGM image")
         elif payload.startswith(b"P6\n"):
             print("payload looks like a valid PPM image")
+        elif payload.startswith(b"qoif"):
+            width = int.from_bytes(payload[4:8], "big")
+            height = int.from_bytes(payload[8:12], "big")
+            print(f"payload looks like a valid QOI image ({width}x{height})")
         else:
-            print("payload does not start with PGM/PPM magic P5/P6")
+            print("payload does not start with PGM/PPM/QOI magic")
         return 0
 
     print("no SNAPSHOT header before timeout")

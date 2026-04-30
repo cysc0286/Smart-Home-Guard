@@ -406,6 +406,121 @@ std::vector<unsigned char> BuildPreviewPpm(const ssne_tensor_t& img_sensor,
   return ppm;
 }
 
+static uint32_t QoiHash(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+  return (r * 3u + g * 5u + b * 7u + a * 11u) % 64u;
+}
+
+static void AppendBe32(std::vector<unsigned char>* out, uint32_t value) {
+  out->push_back(static_cast<unsigned char>((value >> 24) & 0xff));
+  out->push_back(static_cast<unsigned char>((value >> 16) & 0xff));
+  out->push_back(static_cast<unsigned char>((value >> 8) & 0xff));
+  out->push_back(static_cast<unsigned char>(value & 0xff));
+}
+
+std::vector<unsigned char> BuildPreviewQoi(const ssne_tensor_t& img_sensor,
+                                           const std::array<int, 2>& crop_shape,
+                                           int preview_width,
+                                           int preview_height) {
+  const unsigned char* src =
+      static_cast<const unsigned char*>(get_data(const_cast<ssne_tensor_t&>(img_sensor)));
+  const int source_width = crop_shape[0];
+  const int source_height = crop_shape[1];
+
+  std::vector<unsigned char> qoi;
+  qoi.reserve(14 + preview_width * preview_height * 3 / 2);
+  qoi.push_back('q');
+  qoi.push_back('o');
+  qoi.push_back('i');
+  qoi.push_back('f');
+  AppendBe32(&qoi, static_cast<uint32_t>(preview_width));
+  AppendBe32(&qoi, static_cast<uint32_t>(preview_height));
+  qoi.push_back(3);
+  qoi.push_back(0);
+
+  unsigned char index[64][4] = {{0}};
+  unsigned char prev_r = 0;
+  unsigned char prev_g = 0;
+  unsigned char prev_b = 0;
+  const unsigned char prev_a = 255;
+  int run = 0;
+
+  for (int y = 0; y < preview_height; ++y) {
+    const int src_y = y * source_height / preview_height;
+    for (int x = 0; x < preview_width; ++x) {
+      const int src_x = x * source_width / preview_width;
+      const int pair_x = src_x & ~1;
+      const int pair_index = src_y * source_width + pair_x;
+      const unsigned char* pair = src + pair_index * 2;
+
+      const int u_value = pair[0];
+      const int y_value = (src_x & 1) ? pair[3] : pair[1];
+      const int v_value = pair[2];
+
+      unsigned char r;
+      unsigned char g;
+      unsigned char b;
+      YuvToRgb(y_value, u_value, v_value, &r, &g, &b);
+
+      if (r == prev_r && g == prev_g && b == prev_b) {
+        ++run;
+        if (run == 62) {
+          qoi.push_back(static_cast<unsigned char>(0xc0 | (run - 1)));
+          run = 0;
+        }
+        continue;
+      }
+
+      if (run > 0) {
+        qoi.push_back(static_cast<unsigned char>(0xc0 | (run - 1)));
+        run = 0;
+      }
+
+      const uint32_t index_pos = QoiHash(r, g, b, prev_a);
+      if (index[index_pos][0] == r && index[index_pos][1] == g &&
+          index[index_pos][2] == b && index[index_pos][3] == prev_a) {
+        qoi.push_back(static_cast<unsigned char>(index_pos));
+      } else {
+        index[index_pos][0] = r;
+        index[index_pos][1] = g;
+        index[index_pos][2] = b;
+        index[index_pos][3] = prev_a;
+
+        const int dr = static_cast<int>(r) - static_cast<int>(prev_r);
+        const int dg = static_cast<int>(g) - static_cast<int>(prev_g);
+        const int db = static_cast<int>(b) - static_cast<int>(prev_b);
+        const int dr_dg = dr - dg;
+        const int db_dg = db - dg;
+
+        if (dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1) {
+          qoi.push_back(static_cast<unsigned char>(
+              0x40 | ((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2)));
+        } else if (dg >= -32 && dg <= 31 &&
+                   dr_dg >= -8 && dr_dg <= 7 &&
+                   db_dg >= -8 && db_dg <= 7) {
+          qoi.push_back(static_cast<unsigned char>(0x80 | (dg + 32)));
+          qoi.push_back(static_cast<unsigned char>(((dr_dg + 8) << 4) | (db_dg + 8)));
+        } else {
+          qoi.push_back(0xfe);
+          qoi.push_back(r);
+          qoi.push_back(g);
+          qoi.push_back(b);
+        }
+      }
+
+      prev_r = r;
+      prev_g = g;
+      prev_b = b;
+    }
+  }
+
+  if (run > 0) {
+    qoi.push_back(static_cast<unsigned char>(0xc0 | (run - 1)));
+  }
+  for (int i = 0; i < 7; ++i) qoi.push_back(0);
+  qoi.push_back(1);
+  return qoi;
+}
+
 void UpdateSnapshotBuffer(const ssne_tensor_t& img_sensor,
                           const std::array<int, 2>& crop_shape,
                           SnapshotBuffer* snapshot) {
@@ -451,8 +566,19 @@ bool RunSerialSetup(UartControlChannel* uart,
     if (line == "SNAPSHOT") {
       ssne_tensor_t img_sensor;
       processor->GetImage(&img_sensor);
-      std::vector<unsigned char> preview = BuildPreviewPpm(
+      std::vector<unsigned char> preview = BuildPreviewQoi(
           img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
+      const std::string ppm_header = "P6\n" +
+                                     std::to_string(coco_config::kSerialPreviewWidth) + " " +
+                                     std::to_string(coco_config::kSerialPreviewHeight) + "\n255\n";
+      const size_t ppm_payload_size =
+          ppm_header.size() +
+          static_cast<size_t>(coco_config::kSerialPreviewWidth) *
+          static_cast<size_t>(coco_config::kSerialPreviewHeight) * 3u;
+      if (preview.size() >= ppm_payload_size) {
+        preview = BuildPreviewPpm(
+            img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
+      }
       std::string header = "SNAPSHOT " +
                            std::to_string(coco_config::kSerialPreviewWidth) + " " +
                            std::to_string(coco_config::kSerialPreviewHeight) + " " +
