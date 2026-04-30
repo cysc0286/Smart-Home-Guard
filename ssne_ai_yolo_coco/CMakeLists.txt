@@ -18,6 +18,7 @@ add_executable(
   ${PROJECT_SOURCE_DIR}/src/gpio_alarm_controller.cpp
   ${PROJECT_SOURCE_DIR}/src/osd-device.cpp
   ${PROJECT_SOURCE_DIR}/src/pipeline_image.cpp
+  ${PROJECT_SOURCE_DIR}/src/uart_control_channel.cpp
   ${PROJECT_SOURCE_DIR}/src/utils.cpp
 )
 
