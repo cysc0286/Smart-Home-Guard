@@ -14,7 +14,7 @@
 #include "common.hpp"
 
 #define BUFFER_TYPE_DMABUF  0x1
-#define OSD_LAYER_SIZE 3  // 只使用3个图层：0(检测框), 1(固定正方形), 2(位图)
+#define OSD_LAYER_SIZE 2  // 只使用2个图层：0(检测框), 1(备用)
 
 namespace sst{
 namespace device{

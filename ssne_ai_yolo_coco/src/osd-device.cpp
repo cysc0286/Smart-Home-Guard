@@ -70,64 +70,7 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
     }
 
-    // init image layer (TYPE_IMAGE) for layer 2 (bitmap)
-    {
-        int layer_index = 2;
-        // DMA size for texture layer: 1920*1080 bytes (full HD resolution)
-        int texture_dma_size = 0x20000;
-        osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, texture_dma_size);
-        sleep(0.25);  // 等待DMA分配完成
-        osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma_2, texture_dma_size);
-        int dma_fd = osd_get_buffer_fd(m_osd_handle, m_layer_dma[layer_index].dma);
-
-        LAYER_ATTR_S osd_layer;
-        osd_layer.codeTYPE = SS_TYPE_RLE;
-        osd_layer.layer_data_RLE.osd_buf.buf_type = BUFFER_TYPE_DMABUF;
-        osd_layer.layer_data_RLE.osd_buf.buf.fd_dmabuf = dma_fd;
-        osd_layer.layerStart.layer_start_x = 0;
-        osd_layer.layerStart.layer_start_y = 0;
-        osd_layer.layerSize.layer_width = m_width;
-        osd_layer.layerSize.layer_height = m_height;
-        osd_layer.layer_rgn = {TYPE_IMAGE, {m_width, m_height}};
-
-        int ret = osd_create_layer(m_osd_handle, (ssLAYER_HANDLE)layer_index, &osd_layer);
-        if (ret != 0) {
-            std::cerr << "[OsdDevice] ERROR: osd_create_layer failed! ret=" << ret
-                      << ", layer_index=" << layer_index << std::endl;
-        }
-
-        ret = osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
-        if (ret != 0) {
-            std::cerr << "[OsdDevice] ERROR: osd_set_layer_buffer failed! ret=" << ret
-                      << ", layer_index=" << layer_index << std::endl;
-        }
-    }
-
-    // 图层0-1用于quad-rangle，图层2用于位图
-    // 图层3-4未使用，已删除以节省内存
-
-    // // init run-length layer
-    // {
-    //     // run-length 最后一层画标定线
-    //     int layer_index = OSD_LAYER_SIZE - 1;
-    //     osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, 0x20000);
-    //     int dma_fd = osd_get_buffer_fd(m_osd_handle, m_layer_dma[layer_index].dma);
-
-    //     LAYER_ATTR_S osd_layer;
-    //     osd_layer.codeTYPE = SS_TYPE_RLE;
-    //     osd_layer.layer_data_RLE.osd_buf.buf_type = BUFFER_TYPE_DMABUF;
-    //     osd_layer.layer_data_RLE.osd_buf.buf.fd_dmabuf = dma_fd;
-    //     osd_layer.layerStart.layer_start_x = 0;
-    //     osd_layer.layerStart.layer_start_y = 0;
-    //     osd_layer.layerSize.layer_width = m_width;
-    //     osd_layer.layerSize.layer_height = m_height;
-    //     osd_layer.layer_rgn = {TYPE_IMAGE, {m_width, m_height}};
-    //     osd_create_layer(m_osd_handle, (ssLAYER_HANDLE)layer_index, &osd_layer);
-    //     osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
-    // }
-
-    // // draw image use run-length
-    // DrawTexture(m_texture_path.c_str(), OSD_LAYER_SIZE - 1);
+    // 只使用2个GRAPHIC层(0和1)画矩形框，不创建IMAGE层
 }
 
 
@@ -235,8 +178,6 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
         LOG_DEBUG("Draw --- osd_clean_layer\n");
         return;
     }
-    // Clear previous frame's quads before adding new ones to prevent accumulation
-    osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
     int ret = 0;
 
     // generate qrangle box
