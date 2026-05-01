@@ -24,7 +24,7 @@ class UartControlChannel {
     kFifoBytes = 32,
     kPollIntervalUs = 2000,
     kMaxLineBytes = 4096,
-    kTxChunkGapUs = 100,
+    kTxChunkGapUs = 20,
   };
 
   uart_handle_t handle_;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -11,9 +12,10 @@
 
 // Temporal debounce tracker for object detections.
 //
-// A detection must appear in kOnFrames consecutive frames before being shown.
-// Once confirmed, it stays visible until absent for kOffFrames consecutive frames.
-// Box coordinates are smoothed with exponential moving average to reduce jitter.
+// A detection must remain matched for coco_config::kAlarmConfirmMs before being
+// shown. Once confirmed, it stays visible until absent for
+// coco_config::kAlarmClearMs. Box coordinates are smoothed with exponential
+// moving average to reduce jitter.
 class DebounceTracker {
  public:
   struct Track {
@@ -24,9 +26,12 @@ class DebounceTracker {
     int   on_count  = 0;        // consecutive frames present
     int   off_count = 0;        // consecutive frames absent
     bool  confirmed = false;    // visible to caller
+    long long first_seen_ms = 0;
+    long long last_seen_ms  = 0;
   };
 
   void Update(const CocoDetectionResult& detections) {
+    const long long now_ms = NowMs();
     // Mark all tracks as unmatched
     std::vector<bool> track_matched(tracks_.size(), false);
     std::vector<bool> det_matched(detections.detections.size(), false);
@@ -54,7 +59,8 @@ class DebounceTracker {
         t.score     = det.score;
         t.on_count  = std::min(t.on_count + 1, 30);
         t.off_count = 0;
-        t.confirmed = (t.on_count >= kOnFrames);
+        t.last_seen_ms = now_ms;
+        t.confirmed = ((now_ms - t.first_seen_ms) >= coco_config::kAlarmConfirmMs);
         track_matched[best_ti] = true;
         det_matched[di]        = true;
       }
@@ -71,7 +77,9 @@ class DebounceTracker {
     // Remove stale tracks
     tracks_.erase(
         std::remove_if(tracks_.begin(), tracks_.end(),
-                       [](const Track& t) { return t.off_count > kOffFrames; }),
+                       [now_ms](const Track& t) {
+                         return (now_ms - t.last_seen_ms) > coco_config::kAlarmClearMs;
+                       }),
         tracks_.end());
 
     // Add new tracks for unmatched detections
@@ -86,6 +94,8 @@ class DebounceTracker {
         t.on_count  = 1;
         t.off_count = 0;
         t.confirmed = false;
+        t.first_seen_ms = now_ms;
+        t.last_seen_ms  = now_ms;
         tracks_.push_back(t);
       }
     }
@@ -116,16 +126,18 @@ class DebounceTracker {
   }
 
  private:
-  // Minimum consecutive frames present to confirm a detection
-  static constexpr int   kOnFrames     = 3;
-  // Frames absent before removing a track
-  static constexpr int   kOffFrames    = 5;
   // Minimum IoU to match a detection to an existing track
   static constexpr float kIoUThreshold = 0.3f;
   // Exponential smoothing factor (0=no update, 1=no smoothing)
   static constexpr float kSmoothing    = 0.4f;
 
   std::vector<Track> tracks_;
+
+  static long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
 
   static float IoU(const std::array<float, 4>& a,
                    const std::array<float, 4>& b) {

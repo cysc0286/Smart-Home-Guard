@@ -32,6 +32,8 @@ static const int   kNumHeads        = 6;    // P3_box,P3_cls,P4_box,P4_cls,P5_bo
 static const float kConfThreshold   = 0.3f;
 static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
+static const int   kAlarmConfirmMs  = 800;
+static const int   kAlarmClearMs    = 500;
 
 static const std::array<int, 3> kStrides = {8, 16, 32};
 

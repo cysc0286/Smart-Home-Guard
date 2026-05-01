@@ -24,30 +24,63 @@ DEFAULT_CONFIG_FILE = "controller_config.json"
 
 
 @dataclass(slots=True)
-class RectZone:
-    x1: int
-    y1: int
-    x2: int
-    y2: int
+class Zone:
+    shape: str
+    points: list[tuple[int, int]]
+    alarm_classes: list[str]
 
-    def normalized(self) -> "RectZone":
-        return RectZone(
-            x1=min(self.x1, self.x2),
-            y1=min(self.y1, self.y2),
-            x2=max(self.x1, self.x2),
-            y2=max(self.y1, self.y2),
-        )
+    @classmethod
+    def from_rect(
+        cls,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        alarm_classes: list[str] | None = None,
+    ) -> "Zone":
+        left = min(x1, x2)
+        right = max(x1, x2)
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+        return cls(shape="rect", points=[(left, top), (right, bottom)], alarm_classes=alarm_classes or [])
 
-    def to_dict(self) -> dict[str, int | str]:
+    def normalized(self) -> "Zone":
+        if self.shape == "rect" and len(self.points) >= 2:
+            (x1, y1), (x2, y2) = self.points[:2]
+            return Zone.from_rect(x1, y1, x2, y2, self.alarm_classes)
+        return Zone(shape="polygon", points=list(self.points), alarm_classes=list(self.alarm_classes))
+
+    def is_complete(self) -> bool:
+        if self.shape == "rect":
+            return len(self.points) >= 2
+        return len(self.points) >= 3
+
+    def to_dict(self) -> dict[str, Any]:
         zone = self.normalized()
+        if zone.shape == "polygon":
+            return {
+                "type": "zone_update",
+                "shape": "polygon",
+                "points": [[int(x), int(y)] for x, y in zone.points],
+                "alarm_classes": list(zone.alarm_classes),
+            }
+        (x1, y1), (x2, y2) = zone.points[:2]
         return {
             "type": "zone_update",
             "shape": "rect",
-            "x1": zone.x1,
-            "y1": zone.y1,
-            "x2": zone.x2,
-            "y2": zone.y2,
+            "x1": int(x1),
+            "y1": int(y1),
+            "x2": int(x2),
+            "y2": int(y2),
+            "alarm_classes": list(zone.alarm_classes),
         }
+
+    def describe(self) -> str:
+        zone = self.normalized()
+        if zone.shape == "polygon":
+            return f"polygon {len(zone.points)} points"
+        (x1, y1), (x2, y2) = zone.points[:2]
+        return f"rect ({x1},{y1})-({x2},{y2})"
 
 
 @dataclass(slots=True)
@@ -65,12 +98,15 @@ class ControllerConfig:
     serial_port: str = "COM3"
     serial_baudrate: int = 115200
     serial_timeout_sec: float = 10.0
+    serial_idle_timeout_sec: float = 0.08
     board_ip: str = "192.168.1.88"
     board_port: int = 9000
     zone_file: str = DEFAULT_ZONE_FILE
     auto_send: bool = True
     auto_refresh_after_send: bool = True
+    auto_exit_after_send: bool = True
     auto_refresh_snapshot: bool = True
+    alarm_classes: list[str] | str | None = None
     snapshot_refresh_interval_ms: int = 500
     startup_retry: int = 5
     startup_retry_interval: float = 1.0
@@ -108,12 +144,15 @@ def load_controller_config(config_path: Path) -> ControllerConfig:
     config.tcp_timeout_sec = max(float(config.tcp_timeout_sec), 0.1)
     config.serial_baudrate = max(int(config.serial_baudrate), 9600)
     config.serial_timeout_sec = max(float(config.serial_timeout_sec), 0.1)
+    config.serial_idle_timeout_sec = max(float(config.serial_idle_timeout_sec), 0.05)
     config.snapshot_refresh_interval_ms = max(int(config.snapshot_refresh_interval_ms), 100)
     config.window_width = max(int(config.window_width), 320)
     config.window_height = max(int(config.window_height), 240)
     config.auto_send = bool(config.auto_send)
     config.auto_refresh_after_send = bool(config.auto_refresh_after_send)
+    config.auto_exit_after_send = bool(config.auto_exit_after_send)
     config.auto_refresh_snapshot = bool(config.auto_refresh_snapshot)
+    config.alarm_classes = normalize_alarm_classes(config.alarm_classes)
     config.snapshot_source = str(config.snapshot_source).strip().lower()
     config.snapshot_url = str(config.snapshot_url)
     config.snapshot_file = str(config.snapshot_file)
@@ -123,6 +162,17 @@ def load_controller_config(config_path: Path) -> ControllerConfig:
     if config.snapshot_source not in {"http", "file", "serial"}:
         raise ValueError("snapshot_source 只能是 'http'、'file' 或 'serial'")
     return config
+
+
+def normalize_alarm_classes(raw: list[str] | str | None) -> list[str]:
+    if raw is None:
+        return ["person", "dog", "cat"]
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",")]
+    else:
+        values = [str(item).strip() for item in raw]
+    classes = [item for item in values if item]
+    return classes or ["person", "dog", "cat"]
 
 
 def merge_args_into_config(config: ControllerConfig, args: argparse.Namespace) -> ControllerConfig:
@@ -138,6 +188,8 @@ def merge_args_into_config(config: ControllerConfig, args: argparse.Namespace) -
         config.serial_baudrate = max(args.serial_baudrate, 9600)
     if args.serial_timeout_sec is not None:
         config.serial_timeout_sec = max(args.serial_timeout_sec, 0.1)
+    if args.serial_idle_timeout_sec is not None:
+        config.serial_idle_timeout_sec = max(args.serial_idle_timeout_sec, 0.05)
     if args.board_ip is not None:
         config.board_ip = args.board_ip
     if args.board_port is not None:
@@ -148,8 +200,12 @@ def merge_args_into_config(config: ControllerConfig, args: argparse.Namespace) -
         config.auto_send = args.auto_send
     if args.auto_refresh_after_send is not None:
         config.auto_refresh_after_send = args.auto_refresh_after_send
+    if args.auto_exit_after_send is not None:
+        config.auto_exit_after_send = args.auto_exit_after_send
     if args.auto_refresh_snapshot is not None:
         config.auto_refresh_snapshot = args.auto_refresh_snapshot
+    if args.alarm_classes is not None:
+        config.alarm_classes = normalize_alarm_classes(args.alarm_classes)
     if args.snapshot_refresh_interval_ms is not None:
         config.snapshot_refresh_interval_ms = max(args.snapshot_refresh_interval_ms, 100)
     if args.startup_retry is not None:
@@ -178,7 +234,7 @@ class ZoneSender(Protocol):
     def display_target(self) -> str:
         ...
 
-    def send(self, zone: RectZone) -> None:
+    def send(self, zone: Zone) -> None:
         ...
 
 
@@ -188,7 +244,7 @@ class TcpZoneSender:
         self.board_port = board_port
         self.timeout_sec = timeout_sec
 
-    def send(self, zone: RectZone) -> None:
+    def send(self, zone: Zone) -> None:
         payload = json.dumps(zone.to_dict(), ensure_ascii=False).encode("utf-8") + b"\n"
         with socket.create_connection(
             (self.board_ip, self.board_port), timeout=self.timeout_sec
@@ -239,15 +295,18 @@ class FileSnapshotClient:
 
 
 class SerialControlClient:
-    def __init__(self, port: str, baudrate: int, timeout_sec: float) -> None:
+    def __init__(self, port: str, baudrate: int, timeout_sec: float, idle_timeout_sec: float) -> None:
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先执行: pip install pyserial")
         self.port = port
         self.baudrate = baudrate
         self.timeout_sec = timeout_sec
+        self.idle_timeout_sec = idle_timeout_sec
 
     def fetch(self) -> SnapshotFrame:
         with self._open_serial() as ser:
+            ser.reset_input_buffer()
+            time.sleep(0.05)
             ser.reset_input_buffer()
             ser.write(b"SNAPSHOT\n")
             ser.flush()
@@ -270,7 +329,7 @@ class SerialControlClient:
                 logical_height=logical_height,
             )
 
-    def send(self, zone: RectZone) -> None:
+    def send(self, zone: Zone) -> None:
         with self._open_serial() as ser:
             ser.reset_input_buffer()
             payload = json.dumps(zone.to_dict(), ensure_ascii=False)
@@ -348,7 +407,7 @@ class SerialControlClient:
                 if not chunk:
                     received = size - remaining
                     idle_sec = time.monotonic() - last_data_time
-                    if received > 0 and (remaining <= 128 or idle_sec >= 0.5):
+                    if received > 0 and (remaining <= 128 or idle_sec >= self.idle_timeout_sec):
                         chunks.append(b"\x00" * remaining)
                         break
                     if idle_sec >= self.timeout_sec:
@@ -443,7 +502,9 @@ class ZoneDrawerApp:
         zone_file: Path,
         auto_send: bool,
         auto_refresh_after_send: bool,
+        auto_exit_after_send: bool,
         auto_refresh_snapshot: bool,
+        alarm_classes: list[str],
         snapshot_refresh_interval_ms: int,
         startup_retry: int,
         startup_retry_interval_sec: float,
@@ -455,7 +516,9 @@ class ZoneDrawerApp:
         self.zone_file = zone_file
         self.auto_send = auto_send
         self.auto_refresh_after_send = auto_refresh_after_send
+        self.auto_exit_after_send = auto_exit_after_send
         self.auto_refresh_snapshot = auto_refresh_snapshot
+        self.alarm_classes = list(alarm_classes)
         self.snapshot_refresh_interval_ms = snapshot_refresh_interval_ms
         self.startup_retry = startup_retry
         self.startup_retry_interval_sec = startup_retry_interval_sec
@@ -466,27 +529,35 @@ class ZoneDrawerApp:
         self.current_image: np.ndarray | None = None
         self.logical_width = 0
         self.logical_height = 0
-        self.dragging = False
-        self.drag_start: tuple[int, int] | None = None
-        self.preview_zone: RectZone | None = None
-        self.current_zone: RectZone | None = self._load_zone()
+        self.draft_points: list[tuple[int, int]] = []
+        self.hover_point: tuple[int, int] | None = None
+        self.current_zone: Zone | None = self._load_zone()
         self.last_status = "Starting: fetching board snapshot..."
+        self.exit_requested = False
 
-    def _load_zone(self) -> RectZone | None:
+    def _load_zone(self) -> Zone | None:
         if not self.zone_file.exists():
             return None
         try:
             data = json.loads(self.zone_file.read_text(encoding="utf-8"))
-            return RectZone(
-                x1=int(data["x1"]),
-                y1=int(data["y1"]),
-                x2=int(data["x2"]),
-                y2=int(data["y2"]),
-            ).normalized()
+            if data.get("shape") == "polygon":
+                points = data.get("points", [])
+                parsed_points = [(int(point[0]), int(point[1])) for point in points]
+                if len(parsed_points) >= 3:
+                    alarm_classes = normalize_alarm_classes(data.get("alarm_classes", self.alarm_classes))
+                    return Zone(shape="polygon", points=parsed_points, alarm_classes=alarm_classes)
+                return None
+            return Zone.from_rect(
+                int(data["x1"]),
+                int(data["y1"]),
+                int(data["x2"]),
+                int(data["y2"]),
+                normalize_alarm_classes(data.get("alarm_classes", self.alarm_classes)),
+            )
         except Exception:
             return None
 
-    def _save_zone(self, zone: RectZone | None) -> None:
+    def _save_zone(self, zone: Zone | None) -> None:
         if zone is None:
             if self.zone_file.exists():
                 self.zone_file.unlink()
@@ -576,22 +647,20 @@ class ZoneDrawerApp:
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
         display = frame.copy()
 
-        zone = self.preview_zone if self.dragging and self.preview_zone is not None else self.current_zone
-        if zone is not None:
-            z = self._logical_to_display(zone)
-            overlay = display.copy()
-            cv2.rectangle(overlay, (z.x1, z.y1), (z.x2, z.y2), (0, 0, 255), -1)
-            cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
-            cv2.rectangle(display, (z.x1, z.y1), (z.x2, z.y2), (0, 0, 255), 2)
-            cv2.putText(
-                display,
-                f"Zone: ({z.x1},{z.y1})-({z.x2},{z.y2})",
-                (z.x1, max(z.y1 - 8, 18)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-            )
+        if self.current_zone is not None:
+            self._draw_zone(display, self.current_zone, (0, 0, 255), filled=True)
+
+        if self.draft_points:
+            draft_display = [self._point_to_display(point) for point in self.draft_points]
+            if self.hover_point is not None:
+                draft_display.append(self._point_to_display(self.hover_point))
+            for start, end in zip(draft_display, draft_display[1:]):
+                cv2.line(display, start, end, (0, 220, 255), 2)
+            for index, point in enumerate(draft_display[: len(self.draft_points)]):
+                radius = 7 if index == 0 else 5
+                cv2.circle(display, point, radius, (0, 220, 255), -1)
+            first = draft_display[0]
+            cv2.circle(display, first, 12, (0, 220, 255), 2)
 
         cv2.rectangle(display, (0, 0), (display.shape[1], 48), (0, 0, 0), -1)
         cv2.putText(
@@ -605,15 +674,54 @@ class ZoneDrawerApp:
         )
         cv2.putText(
             display,
-            "Left-drag: draw | N: new snapshot | S: send | C: clear | Q: quit",
+            "Click: add point | click first point: close | Z: undo | N: snapshot | S: send | C: clear | Q: quit",
             (10, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.48,
             (255, 255, 255),
             1,
         )
 
         return display
+
+    def _draw_zone(
+        self,
+        display: np.ndarray,
+        zone: Zone,
+        color: tuple[int, int, int],
+        filled: bool,
+    ) -> None:
+        display_points = np.array(
+            [self._point_to_display(point) for point in zone.normalized().points],
+            dtype=np.int32,
+        )
+        if display_points.size == 0:
+            return
+        overlay = display.copy()
+        if zone.shape == "polygon" and len(display_points) >= 3:
+            if filled:
+                cv2.fillPoly(overlay, [display_points], color)
+                cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
+            cv2.polylines(display, [display_points], True, color, 2)
+            label_anchor = tuple(display_points[0])
+        elif zone.shape == "rect" and len(display_points) >= 2:
+            (x1, y1), (x2, y2) = display_points[:2]
+            if filled:
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
+            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+            label_anchor = (x1, y1)
+        else:
+            return
+        cv2.putText(
+            display,
+            f"Zone: {zone.describe()}",
+            (label_anchor[0], max(label_anchor[1] - 8, 18)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
 
     def _display_to_logical(self, x: int, y: int) -> tuple[int, int]:
         if self.current_image is None or self.logical_width <= 0 or self.logical_height <= 0:
@@ -625,42 +733,76 @@ class ZoneDrawerApp:
         logical_y = max(0, min(logical_y, self.logical_height - 1))
         return logical_x, logical_y
 
-    def _logical_to_display(self, zone: RectZone) -> RectZone:
+    def _point_to_display(self, point: tuple[int, int]) -> tuple[int, int]:
         if self.current_image is None or self.logical_width <= 0 or self.logical_height <= 0:
-            return zone.normalized()
+            return point
         display_h, display_w = self.current_image.shape[:2]
-        x1 = round(zone.x1 * display_w / max(self.logical_width, 1))
-        y1 = round(zone.y1 * display_h / max(self.logical_height, 1))
-        x2 = round(zone.x2 * display_w / max(self.logical_width, 1))
-        y2 = round(zone.y2 * display_h / max(self.logical_height, 1))
-        return RectZone(x1, y1, x2, y2).normalized()
+        x = round(point[0] * display_w / max(self.logical_width, 1))
+        y = round(point[1] * display_h / max(self.logical_height, 1))
+        return x, y
+
+    def _is_near_first_point(self, x: int, y: int) -> bool:
+        if len(self.draft_points) < 3:
+            return False
+        first_x, first_y = self._point_to_display(self.draft_points[0])
+        dx = x - first_x
+        dy = y - first_y
+        return dx * dx + dy * dy <= 14 * 14
 
     def _mouse_callback(self, event, x, y, _flags, _param) -> None:
         if self.current_image is None:
             return
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.dragging = True
-            self.drag_start = self._display_to_logical(x, y)
-            self.preview_zone = RectZone(*self.drag_start, *self.drag_start)
-        elif event == cv2.EVENT_MOUSEMOVE and self.dragging and self.drag_start is not None:
-            current = self._display_to_logical(x, y)
-            self.preview_zone = RectZone(self.drag_start[0], self.drag_start[1], current[0], current[1])
-        elif event == cv2.EVENT_LBUTTONUP and self.dragging and self.drag_start is not None:
-            self.dragging = False
-            current = self._display_to_logical(x, y)
-            self.current_zone = RectZone(
-                self.drag_start[0], self.drag_start[1], current[0], current[1]
-            ).normalized()
-            self.preview_zone = None
-            self.drag_start = None
-            self._save_zone(self.current_zone)
-            z = self.current_zone
-            self.last_status = f"Zone set: ({z.x1},{z.y1})-({z.x2},{z.y2})"
-            if self.auto_send:
-                self._send_zone()
+            if self._is_near_first_point(x, y):
+                self.current_zone = Zone(
+                    shape="polygon",
+                    points=list(self.draft_points),
+                    alarm_classes=list(self.alarm_classes),
+                )
+                self.draft_points.clear()
+                self.hover_point = None
+                self._save_zone(self.current_zone)
+                self.last_status = f"Zone set: {self.current_zone.describe()}"
+                if self.auto_send:
+                    self._send_zone()
+                return
+
+            point = self._display_to_logical(x, y)
+            self.draft_points.append(point)
+            self.current_zone = None
+            self._save_zone(None)
+            self.last_status = f"Point {len(self.draft_points)} set: ({point[0]},{point[1]})"
+        elif event == cv2.EVENT_MOUSEMOVE:
+            self.hover_point = self._display_to_logical(x, y) if self.draft_points else None
+
+    def _undo_point(self) -> None:
+        if self.draft_points:
+            removed = self.draft_points.pop()
+            self.hover_point = None
+            self.last_status = f"Removed point: ({removed[0]},{removed[1]})"
+            return
+        self.last_status = "No draft point to remove"
+
+    def _finish_polygon_if_ready(self) -> bool:
+        if len(self.draft_points) < 3:
+            self.last_status = "Need at least 3 points before closing the polygon"
+            return False
+        self.current_zone = Zone(
+            shape="polygon",
+            points=list(self.draft_points),
+            alarm_classes=list(self.alarm_classes),
+        )
+        self.draft_points.clear()
+        self.hover_point = None
+        self._save_zone(self.current_zone)
+        self.last_status = f"Zone set: {self.current_zone.describe()}"
+        return True
 
     def _send_zone(self) -> None:
+        if self.current_zone is None and self.draft_points:
+            if not self._finish_polygon_if_ready():
+                return
         if self.current_zone is None:
             self.last_status = "No zone selected"
             return
@@ -670,23 +812,25 @@ class ZoneDrawerApp:
             self.last_status = f"Send failed: {exc}"
             return
 
-        z = self.current_zone.normalized()
         self.last_status = (
             f"Sent to board {self.sender.display_target()} -> "
-            f"({z.x1},{z.y1})-({z.x2},{z.y2})"
+            f"{self.current_zone.describe()}"
         )
+        if self.auto_exit_after_send:
+            self.exit_requested = True
+            return
         if self.auto_refresh_after_send:
             self._fetch_snapshot()
 
     def _clear_zone(self) -> None:
         self.current_zone = None
-        self.preview_zone = None
-        self.drag_start = None
+        self.draft_points.clear()
+        self.hover_point = None
         self._save_zone(None)
         self.last_status = "Zone cleared"
 
     def _maybe_auto_refresh_snapshot(self) -> None:
-        if not self.auto_refresh_snapshot or self.dragging:
+        if not self.auto_refresh_snapshot or self.draft_points:
             return
         now = time.monotonic()
         elapsed_ms = (now - self.last_snapshot_fetch_monotonic) * 1000.0
@@ -705,6 +849,9 @@ class ZoneDrawerApp:
             frame = self.current_image if self.current_image is not None else self._make_blank()
             display = self._draw_overlay(frame)
             cv2.imshow(WINDOW_NAME, display)
+            if self.exit_requested:
+                cv2.destroyAllWindows()
+                return 0
 
             key = cv2.waitKey(30) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
@@ -714,8 +861,13 @@ class ZoneDrawerApp:
                 self._fetch_snapshot()
             elif key in (ord("s"), ord("S")):
                 self._send_zone()
+                if self.exit_requested:
+                    cv2.destroyAllWindows()
+                    return 0
             elif key in (ord("c"), ord("C")):
                 self._clear_zone()
+            elif key in (ord("z"), ord("Z"), 8):
+                self._undo_point()
             self._maybe_auto_refresh_snapshot()
 
 
@@ -762,6 +914,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="串口超时时间（秒）",
     )
     parser.add_argument(
+        "--serial-idle-timeout-sec",
+        type=float,
+        default=None,
+        help="串口图片数据空闲补尾等待时间（秒）",
+    )
+    parser.add_argument(
         "--board-ip",
         default=None,
         help="板端 IP（用于 TCP 发送禁区）",
@@ -790,10 +948,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="发送禁区后是否自动刷新快照",
     )
     parser.add_argument(
+        "--auto-exit-after-send",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="发送禁区后是否自动关闭窗口",
+    )
+    parser.add_argument(
         "--auto-refresh-snapshot",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="运行期间是否自动刷新快照",
+    )
+    parser.add_argument(
+        "--alarm-classes",
+        default=None,
+        help="告警类别白名单，逗号分隔，例如 person,dog,cat",
     )
     parser.add_argument(
         "--snapshot-refresh-interval-ms",
@@ -875,6 +1044,7 @@ def main() -> int:
                 port=config.serial_port,
                 baudrate=config.serial_baudrate,
                 timeout_sec=config.serial_timeout_sec,
+                idle_timeout_sec=config.serial_idle_timeout_sec,
             )
             snapshot_client = serial_client
             sender = serial_client
@@ -884,7 +1054,9 @@ def main() -> int:
         zone_file=resolve_config_path(config.zone_file, config_path.parent),
         auto_send=config.auto_send,
         auto_refresh_after_send=config.auto_refresh_after_send,
+        auto_exit_after_send=config.auto_exit_after_send,
         auto_refresh_snapshot=config.auto_refresh_snapshot,
+        alarm_classes=config.alarm_classes,
         snapshot_refresh_interval_ms=config.snapshot_refresh_interval_ms,
         startup_retry=config.startup_retry,
         startup_retry_interval_sec=config.startup_retry_interval,

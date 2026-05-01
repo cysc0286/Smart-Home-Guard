@@ -10,6 +10,8 @@
 #include <fstream>
 #include <cstdio>
 #include <string>
+#include <cctype>
+#include <cstdlib>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -40,16 +42,60 @@ struct SnapshotBuffer {
   std::mutex mutex;
 };
 
-struct RectZone {
-  int x1 = 0;
-  int y1 = 0;
-  int x2 = 0;
-  int y2 = 0;
+struct ZonePoint {
+  int x;
+  int y;
+
+  ZonePoint() : x(0), y(0) {}
+  ZonePoint(int point_x, int point_y) : x(point_x), y(point_y) {}
+};
+
+struct GuardZone {
+  std::string shape = "none";
+  std::vector<ZonePoint> points;
+  std::vector<int> alarm_class_ids;
   bool active = false;
 
-  void Normalize() {
+  GuardZone() : shape("none"), points(), alarm_class_ids(DefaultAlarmClassIds()), active(false) {}
+
+  void SetRect(int x1, int y1, int x2, int y2) {
+    shape = "rect";
+    active = true;
     if (x1 > x2) std::swap(x1, x2);
     if (y1 > y2) std::swap(y1, y2);
+    points.clear();
+    points.push_back(ZonePoint(x1, y1));
+    points.push_back(ZonePoint(x2, y2));
+  }
+
+  void SetPolygon(const std::vector<ZonePoint>& polygon_points) {
+    shape = "polygon";
+    active = polygon_points.size() >= 3;
+    points = polygon_points;
+  }
+
+  int X1() const { return points.empty() ? 0 : points[0].x; }
+  int Y1() const { return points.empty() ? 0 : points[0].y; }
+  int X2() const { return points.size() < 2 ? 0 : points[1].x; }
+  int Y2() const { return points.size() < 2 ? 0 : points[1].y; }
+
+  std::string Describe() const {
+    if (!active) {
+      return "none";
+    }
+    if (shape == "polygon") {
+      return "polygon points=" + std::to_string(points.size());
+    }
+    return "rect (" + std::to_string(X1()) + "," + std::to_string(Y1()) + ")-(" +
+           std::to_string(X2()) + "," + std::to_string(Y2()) + ")";
+  }
+
+  static std::vector<int> DefaultAlarmClassIds() {
+    std::vector<int> ids;
+    ids.push_back(0);   // person
+    ids.push_back(15);  // cat
+    ids.push_back(16);  // dog
+    return ids;
   }
 };
 
@@ -224,75 +270,266 @@ void ConvertCropBoxesToOriginal(CocoDetectionResult* result) {
   }
 }
 
-bool ParseRectZoneJson(const std::string& json_line, RectZone* zone) {
-  auto extract_int = [&](const char* key, int* value) -> bool {
-    const std::string token = std::string("\"") + key + "\"";
-    const std::size_t key_pos = json_line.find(token);
-    if (key_pos == std::string::npos) {
-      return false;
-    }
-    const std::size_t colon_pos = json_line.find(':', key_pos + token.size());
-    if (colon_pos == std::string::npos) {
-      return false;
-    }
-    std::size_t number_pos = colon_pos + 1;
-    while (number_pos < json_line.size() &&
-           (json_line[number_pos] == ' ' || json_line[number_pos] == '\t')) {
-      ++number_pos;
-    }
-    return std::sscanf(json_line.c_str() + number_pos, "%d", value) == 1;
-  };
-
-  RectZone parsed;
-  if (!extract_int("x1", &parsed.x1) ||
-      !extract_int("y1", &parsed.y1) ||
-      !extract_int("x2", &parsed.x2) ||
-      !extract_int("y2", &parsed.y2)) {
+bool ExtractJsonInt(const std::string& json_line, const char* key, int* value) {
+  const std::string token = std::string("\"") + key + "\"";
+  const std::size_t key_pos = json_line.find(token);
+  if (key_pos == std::string::npos) {
     return false;
   }
-  parsed.Normalize();
-  parsed.active = true;
+  const std::size_t colon_pos = json_line.find(':', key_pos + token.size());
+  if (colon_pos == std::string::npos) {
+    return false;
+  }
+  std::size_t number_pos = colon_pos + 1;
+  while (number_pos < json_line.size() &&
+         (json_line[number_pos] == ' ' || json_line[number_pos] == '\t')) {
+    ++number_pos;
+  }
+  return std::sscanf(json_line.c_str() + number_pos, "%d", value) == 1;
+}
+
+std::vector<int> ExtractJsonIntArray(const std::string& text) {
+  std::vector<int> values;
+  for (std::size_t i = 0; i < text.size();) {
+    if (text[i] != '-' && !std::isdigit(static_cast<unsigned char>(text[i]))) {
+      ++i;
+      continue;
+    }
+    char* end_ptr = nullptr;
+    const long value = std::strtol(text.c_str() + i, &end_ptr, 10);
+    if (end_ptr == text.c_str() + i) {
+      ++i;
+      continue;
+    }
+    values.push_back(static_cast<int>(value));
+    i = static_cast<std::size_t>(end_ptr - text.c_str());
+  }
+  return values;
+}
+
+bool ExtractJsonArrayText(const std::string& json_line,
+                          const char* key,
+                          std::string* array_text) {
+  const std::string token = std::string("\"") + key + "\"";
+  const std::size_t key_pos = json_line.find(token);
+  if (key_pos == std::string::npos) {
+    return false;
+  }
+  const std::size_t colon_pos = json_line.find(':', key_pos + token.size());
+  if (colon_pos == std::string::npos) {
+    return false;
+  }
+  const std::size_t array_start = json_line.find('[', colon_pos);
+  if (array_start == std::string::npos) {
+    return false;
+  }
+  int depth = 0;
+  for (std::size_t pos = array_start; pos < json_line.size(); ++pos) {
+    if (json_line[pos] == '[') {
+      ++depth;
+    } else if (json_line[pos] == ']') {
+      --depth;
+      if (depth == 0) {
+        *array_text = json_line.substr(array_start, pos - array_start + 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+int CocoClassIdByName(const std::string& name) {
+  for (std::size_t i = 0; i < coco_config::kClassNames.size(); ++i) {
+    if (name == coco_config::kClassNames[i]) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+std::vector<int> ExtractJsonStringClassNames(const std::string& array_text) {
+  std::vector<int> ids;
+  std::size_t pos = 0;
+  while (pos < array_text.size()) {
+    const std::size_t start = array_text.find('"', pos);
+    if (start == std::string::npos) {
+      break;
+    }
+    const std::size_t end = array_text.find('"', start + 1);
+    if (end == std::string::npos) {
+      break;
+    }
+    const std::string name = array_text.substr(start + 1, end - start - 1);
+    const int class_id = CocoClassIdByName(name);
+    if (class_id >= 0 && std::find(ids.begin(), ids.end(), class_id) == ids.end()) {
+      ids.push_back(class_id);
+    }
+    pos = end + 1;
+  }
+  return ids;
+}
+
+void ParseAlarmClassIds(const std::string& json_line, GuardZone* zone) {
+  std::string array_text;
+  if (!ExtractJsonArrayText(json_line, "alarm_class_ids", &array_text) &&
+      !ExtractJsonArrayText(json_line, "alarm_classes", &array_text)) {
+    return;
+  }
+
+  std::vector<int> ids = ExtractJsonStringClassNames(array_text);
+  if (ids.empty()) {
+    ids = ExtractJsonIntArray(array_text);
+    ids.erase(std::remove_if(ids.begin(), ids.end(),
+                             [](int id) { return id < 0 || id >= coco_config::kNumClasses; }),
+              ids.end());
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  }
+  if (!ids.empty()) {
+    zone->alarm_class_ids = ids;
+  }
+}
+
+bool ParsePolygonZoneJson(const std::string& json_line, GuardZone* zone) {
+  const std::string token = "\"points\"";
+  const std::size_t key_pos = json_line.find(token);
+  if (key_pos == std::string::npos) {
+    return false;
+  }
+  const std::size_t colon_pos = json_line.find(':', key_pos + token.size());
+  if (colon_pos == std::string::npos) {
+    return false;
+  }
+  const std::size_t array_start = json_line.find('[', colon_pos);
+  const std::size_t array_end = json_line.rfind(']');
+  if (array_start == std::string::npos || array_end == std::string::npos ||
+      array_end <= array_start) {
+    return false;
+  }
+
+  std::vector<int> values = ExtractJsonIntArray(json_line.substr(array_start, array_end - array_start + 1));
+  if (values.size() < 6 || (values.size() % 2) != 0) {
+    return false;
+  }
+
+  std::vector<ZonePoint> points;
+  points.reserve(values.size() / 2);
+  for (std::size_t i = 0; i + 1 < values.size(); i += 2) {
+    points.push_back(ZonePoint(values[i], values[i + 1]));
+  }
+  GuardZone parsed;
+  parsed.SetPolygon(points);
+  if (!parsed.active) {
+    return false;
+  }
+  ParseAlarmClassIds(json_line, &parsed);
   *zone = parsed;
   return true;
 }
 
-bool SaveZoneToFile(const RectZone& zone, const char* path) {
+bool ParseRectZoneJson(const std::string& json_line, GuardZone* zone) {
+  int x1 = 0;
+  int y1 = 0;
+  int x2 = 0;
+  int y2 = 0;
+  if (!ExtractJsonInt(json_line, "x1", &x1) ||
+      !ExtractJsonInt(json_line, "y1", &y1) ||
+      !ExtractJsonInt(json_line, "x2", &x2) ||
+      !ExtractJsonInt(json_line, "y2", &y2)) {
+    return false;
+  }
+  GuardZone parsed;
+  parsed.SetRect(x1, y1, x2, y2);
+  ParseAlarmClassIds(json_line, &parsed);
+  *zone = parsed;
+  return true;
+}
+
+bool ParseZoneJson(const std::string& json_line, GuardZone* zone) {
+  if (json_line.find("\"polygon\"") != std::string::npos) {
+    return ParsePolygonZoneJson(json_line, zone);
+  }
+  return ParseRectZoneJson(json_line, zone);
+}
+
+bool SaveZoneToFile(const GuardZone& zone, const char* path) {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output.is_open()) {
     return false;
   }
   output << "{\n"
-         << "  \"type\": \"zone_update\",\n"
-         << "  \"shape\": \"rect\",\n"
-         << "  \"x1\": " << zone.x1 << ",\n"
-         << "  \"y1\": " << zone.y1 << ",\n"
-         << "  \"x2\": " << zone.x2 << ",\n"
-         << "  \"y2\": " << zone.y2 << "\n"
-         << "}\n";
+         << "  \"type\": \"zone_update\",\n";
+  if (zone.shape == "polygon") {
+    output << "  \"shape\": \"polygon\",\n"
+           << "  \"points\": [";
+    for (std::size_t i = 0; i < zone.points.size(); ++i) {
+      if (i > 0) output << ", ";
+      output << "[" << zone.points[i].x << ", " << zone.points[i].y << "]";
+    }
+    output << "],\n";
+  } else {
+    output << "  \"shape\": \"rect\",\n"
+           << "  \"x1\": " << zone.X1() << ",\n"
+           << "  \"y1\": " << zone.Y1() << ",\n"
+           << "  \"x2\": " << zone.X2() << ",\n"
+           << "  \"y2\": " << zone.Y2() << ",\n";
+  }
+  output << "  \"alarm_classes\": [";
+  for (std::size_t i = 0; i < zone.alarm_class_ids.size(); ++i) {
+    if (i > 0) output << ", ";
+    const int class_id = zone.alarm_class_ids[i];
+    if (class_id >= 0 && class_id < coco_config::kNumClasses) {
+      output << "\"" << coco_config::kClassNames[class_id] << "\"";
+    } else {
+      output << class_id;
+    }
+  }
+  output << "]\n";
+  output << "}\n";
   output.close();
   return static_cast<bool>(output);
 }
 
-bool LoadZoneFromFile(const char* path, RectZone* zone) {
+bool LoadZoneFromFile(const char* path, GuardZone* zone) {
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
     return false;
   }
   std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-  return ParseRectZoneJson(content, zone);
+  return ParseZoneJson(content, zone);
 }
 
-bool IsDetectionInsideZone(const CocoDetection& det, const RectZone& zone) {
+bool IsPointInsidePolygon(float x, float y, const std::vector<ZonePoint>& points) {
+  bool inside = false;
+  const std::size_t count = points.size();
+  for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
+    const float xi = static_cast<float>(points[i].x);
+    const float yi = static_cast<float>(points[i].y);
+    const float xj = static_cast<float>(points[j].x);
+    const float yj = static_cast<float>(points[j].y);
+    const bool intersects = ((yi > y) != (yj > y)) &&
+        (x < (xj - xi) * (y - yi) / ((yj - yi) == 0.0f ? 0.0001f : (yj - yi)) + xi);
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+bool IsDetectionInsideZone(const CocoDetection& det, const GuardZone& zone) {
   if (!zone.active) {
     return true;
   }
   const float center_x = (det.box_xyxy[0] + det.box_xyxy[2]) * 0.5f;
   const float center_y = (det.box_xyxy[1] + det.box_xyxy[3]) * 0.5f;
-  return center_x >= zone.x1 && center_x <= zone.x2 &&
-         center_y >= zone.y1 && center_y <= zone.y2;
+  if (zone.shape == "polygon") {
+    return IsPointInsidePolygon(center_x, center_y, zone.points);
+  }
+  return center_x >= zone.X1() && center_x <= zone.X2() &&
+         center_y >= zone.Y1() && center_y <= zone.Y2();
 }
 
-void FilterDetectionsByZone(CocoDetectionResult* result, const RectZone& zone) {
+void FilterDetectionsByZone(CocoDetectionResult* result, const GuardZone& zone) {
   if (!zone.active) {
     return;
   }
@@ -300,6 +537,21 @@ void FilterDetectionsByZone(CocoDetectionResult* result, const RectZone& zone) {
   filtered.reserve(result->detections.size());
   for (const auto& det : result->detections) {
     if (IsDetectionInsideZone(det, zone)) {
+      filtered.push_back(det);
+    }
+  }
+  result->detections.swap(filtered);
+}
+
+void FilterDetectionsByAlarmClasses(CocoDetectionResult* result, const GuardZone& zone) {
+  const std::vector<int>& alarm_class_ids = zone.alarm_class_ids.empty()
+      ? GuardZone::DefaultAlarmClassIds()
+      : zone.alarm_class_ids;
+  std::vector<CocoDetection> filtered;
+  filtered.reserve(result->detections.size());
+  for (const auto& det : result->detections) {
+    if (std::find(alarm_class_ids.begin(), alarm_class_ids.end(), det.class_id) !=
+        alarm_class_ids.end()) {
       filtered.push_back(det);
     }
   }
@@ -546,13 +798,59 @@ bool SaveSnapshotToFile(const std::vector<unsigned char>& pgm, const char* path)
   return std::rename(temp_path.c_str(), path) == 0;
 }
 
+bool ApplyZoneCommand(UartControlChannel* uart, const std::string& json, GuardZone* zone) {
+  GuardZone parsed;
+  if (!ParseZoneJson(json, &parsed)) {
+    uart->SendTextLine("ERR ZONE");
+    return false;
+  }
+  if (!SaveZoneToFile(parsed, coco_config::kZoneConfigPath)) {
+    fprintf(stderr, "[ZONE] Failed to save zone to %s; using in-memory zone only\n",
+            coco_config::kZoneConfigPath);
+  }
+  *zone = parsed;
+  printf("[ZONE] Updated: %s\n", zone->Describe().c_str());
+  uart->SendTextLine("OK ZONE");
+  return true;
+}
+
+bool SendSerialSnapshot(UartControlChannel* uart,
+                        IMAGEPROCESSOR* processor,
+                        const std::array<int, 2>& crop_shape) {
+  ssne_tensor_t img_sensor;
+  if (!processor->GetImage(&img_sensor)) {
+    uart->SendTextLine("ERR SNAPSHOT");
+    return false;
+  }
+  std::vector<unsigned char> preview = BuildPreviewQoi(
+      img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
+  const std::string ppm_header = "P6\n" +
+                                 std::to_string(coco_config::kSerialPreviewWidth) + " " +
+                                 std::to_string(coco_config::kSerialPreviewHeight) + "\n255\n";
+  const size_t ppm_payload_size =
+      ppm_header.size() +
+      static_cast<size_t>(coco_config::kSerialPreviewWidth) *
+      static_cast<size_t>(coco_config::kSerialPreviewHeight) * 3u;
+  if (preview.size() >= ppm_payload_size) {
+    preview = BuildPreviewPpm(
+        img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
+  }
+  std::string header = "SNAPSHOT " +
+                       std::to_string(coco_config::kSerialPreviewWidth) + " " +
+                       std::to_string(coco_config::kSerialPreviewHeight) + " " +
+                       std::to_string(crop_shape[0]) + " " +
+                       std::to_string(crop_shape[1]) + " " +
+                       std::to_string(preview.size()) + "\n";
+  return uart->SendBytes(reinterpret_cast<const uint8_t*>(header.data()), header.size()) &&
+         uart->SendBytes(preview.data(), preview.size());
+}
+
 bool RunSerialSetup(UartControlChannel* uart,
                     IMAGEPROCESSOR* processor,
                     const std::array<int, 2>& crop_shape,
-                    RectZone* zone) {
+                    GuardZone* zone) {
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, zone)) {
-    printf("[SETUP] Loaded existing zone: (%d,%d)-(%d,%d)\n",
-           zone->x1, zone->y1, zone->x2, zone->y2);
+    printf("[SETUP] Loaded existing zone: %s\n", zone->Describe().c_str());
   } else {
     printf("[SETUP] No existing zone config found\n");
   }
@@ -564,44 +862,12 @@ bool RunSerialSetup(UartControlChannel* uart,
       continue;
     }
     if (line == "SNAPSHOT") {
-      ssne_tensor_t img_sensor;
-      processor->GetImage(&img_sensor);
-      std::vector<unsigned char> preview = BuildPreviewQoi(
-          img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
-      const std::string ppm_header = "P6\n" +
-                                     std::to_string(coco_config::kSerialPreviewWidth) + " " +
-                                     std::to_string(coco_config::kSerialPreviewHeight) + "\n255\n";
-      const size_t ppm_payload_size =
-          ppm_header.size() +
-          static_cast<size_t>(coco_config::kSerialPreviewWidth) *
-          static_cast<size_t>(coco_config::kSerialPreviewHeight) * 3u;
-      if (preview.size() >= ppm_payload_size) {
-        preview = BuildPreviewPpm(
-            img_sensor, crop_shape, coco_config::kSerialPreviewWidth, coco_config::kSerialPreviewHeight);
-      }
-      std::string header = "SNAPSHOT " +
-                           std::to_string(coco_config::kSerialPreviewWidth) + " " +
-                           std::to_string(coco_config::kSerialPreviewHeight) + " " +
-                           std::to_string(crop_shape[0]) + " " +
-                           std::to_string(crop_shape[1]) + " " +
-                           std::to_string(preview.size()) + "\n";
-      if (!uart->SendBytes(reinterpret_cast<const uint8_t*>(header.data()), header.size()) ||
-          !uart->SendBytes(preview.data(), preview.size())) {
+      if (!SendSerialSnapshot(uart, processor, crop_shape)) {
         fprintf(stderr, "[SETUP] Failed to send snapshot over UART\n");
         return false;
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
-      RectZone parsed;
-      if (!ParseRectZoneJson(line.substr(5), &parsed)) {
-        uart->SendTextLine("ERR ZONE");
-        continue;
-      }
-      if (!SaveZoneToFile(parsed, coco_config::kZoneConfigPath)) {
-        fprintf(stderr, "[SETUP] Failed to save zone to %s; using in-memory zone only\n",
-                coco_config::kZoneConfigPath);
-      }
-      *zone = parsed;
-      uart->SendTextLine("OK ZONE");
+      ApplyZoneCommand(uart, line.substr(5), zone);
     } else if (line == "START") {
       uart->SendTextLine("OK START");
       return true;
@@ -612,6 +878,34 @@ bool RunSerialSetup(UartControlChannel* uart,
     }
   }
   return false;
+}
+
+void PollRuntimeSerial(UartControlChannel* uart,
+                       IMAGEPROCESSOR* processor,
+                       const std::array<int, 2>& crop_shape,
+                       GuardZone* zone) {
+  if (uart == nullptr || !uart->IsOpen()) {
+    return;
+  }
+  std::string line;
+  int handled = 0;
+  while (handled < 4 && uart->ReceiveLine(&line, 0)) {
+    ++handled;
+    if (line == "SNAPSHOT") {
+      if (!SendSerialSnapshot(uart, processor, crop_shape)) {
+        fprintf(stderr, "[UART] Failed to send runtime snapshot\n");
+      }
+    } else if (line.rfind("ZONE ", 0) == 0) {
+      ApplyZoneCommand(uart, line.substr(5), zone);
+    } else if (line == "START") {
+      uart->SendTextLine("OK START");
+    } else if (line == "QUIT") {
+      std::lock_guard<std::mutex> lock(g_mtx);
+      g_exit_flag = true;
+    } else if (!line.empty()) {
+      uart->SendTextLine("ERR CMD");
+    }
+  }
 }
 
 int main() {
@@ -658,12 +952,11 @@ int main() {
   CocoDetectionResult det_result;
   DebounceTracker     tracker;
   SnapshotBuffer      snapshot_buffer;
-  RectZone            active_zone;
+  GuardZone           active_zone;
   UartControlChannel  uart_channel;
 
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, &active_zone)) {
-    printf("[ZONE] Loaded zone: (%d,%d)-(%d,%d)\n",
-           active_zone.x1, active_zone.y1, active_zone.x2, active_zone.y2);
+    printf("[ZONE] Loaded zone: %s\n", active_zone.Describe().c_str());
   } else {
     printf("[ZONE] No zone config found, detections will run without zone filtering\n");
   }
@@ -735,6 +1028,10 @@ int main() {
     }
     cam_fail_count = 0;
 
+    if (coco_config::kEnableSerialSetup) {
+      PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone);
+    }
+
     ++fps_frame_count;
     const auto fps_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - fps_window_start).count();
@@ -776,6 +1073,7 @@ int main() {
     infer_fail_count = 0;
 
     FilterDetectionsByZone(&det_result, active_zone);
+    FilterDetectionsByAlarmClasses(&det_result, active_zone);
     ConvertCropBoxesToOriginal(&det_result);
 
     tracker.Update(det_result);
