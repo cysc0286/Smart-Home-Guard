@@ -10,7 +10,7 @@ import serial
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Debug the board UART setup channel.")
-    parser.add_argument("--port", default="COM13", help="Windows serial port, for example COM13")
+    parser.add_argument("--port", default="COM6", help="Windows serial port, for example COM6")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument(

@@ -112,12 +112,13 @@ void COCO_DETECTOR::BuildDetectionsForScale(const float* box_ptr,
         ltrb[edge] = DecodeDFLEdge(box_ptr + box_offset + edge * coco_config::kRegMax);
       }
 
-      const float anchor_x = (static_cast<float>(x) + 0.5f) * static_cast<float>(stride);
-      const float anchor_y = (static_cast<float>(y) + 0.5f) * static_cast<float>(stride);
-      float x1 = (anchor_x - ltrb[0]) * w_scale;
-      float y1 = (anchor_y - ltrb[1]) * h_scale;
-      float x2 = (anchor_x + ltrb[2]) * w_scale;
-      float y2 = (anchor_y + ltrb[3]) * h_scale;
+      const float stride_f = static_cast<float>(stride);
+      const float anchor_x = (static_cast<float>(x) + 0.5f) * stride_f;
+      const float anchor_y = (static_cast<float>(y) + 0.5f) * stride_f;
+      float x1 = (anchor_x - ltrb[0] * stride_f) * w_scale;
+      float y1 = (anchor_y - ltrb[1] * stride_f) * h_scale;
+      float x2 = (anchor_x + ltrb[2] * stride_f) * w_scale;
+      float y2 = (anchor_y + ltrb[3] * stride_f) * h_scale;
 
       x1 = std::max(0.0f, std::min(x1, static_cast<float>(img_shape[0] - 1)));
       y1 = std::max(0.0f, std::min(y1, static_cast<float>(img_shape[1] - 1)));

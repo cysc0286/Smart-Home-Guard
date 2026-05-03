@@ -3,6 +3,7 @@
 #include <chrono>
 #include <stdio.h>
 
+#include "../include/coco_config.hpp"
 #include "gpio_api.h"
 
 const uint16_t GpioAlarmController::kLedPin = GPIO_PIN_8;
@@ -20,7 +21,8 @@ GpioAlarmController::GpioAlarmController()
       led_level_high_(false),
       buzzer_level_high_(false),
       last_toggle_ms_(0),
-      last_update_call_ms_(0) {}
+      last_update_call_ms_(0),
+      last_object_seen_ms_(0) {}
 
 GpioAlarmController::~GpioAlarmController() {
   Release();
@@ -96,7 +98,15 @@ void GpioAlarmController::Update(bool has_object) {
                                std::chrono::steady_clock::now().time_since_epoch())
                                .count();
 
-  if (!has_object) {
+  // 报警保持：目标丢失后仍保持报警 kAlarmHoldMs 毫秒
+  if (has_object) {
+    last_object_seen_ms_ = now_ms;
+  }
+  const bool alarm_active = has_object ||
+      (last_object_seen_ms_ > 0 &&
+       (now_ms - last_object_seen_ms_) < coco_config::kAlarmHoldMs);
+
+  if (!alarm_active) {
     SetLed(false);
     SetBuzzer(false);
     buzzer_on_ = false;
@@ -140,6 +150,7 @@ void GpioAlarmController::Release() {
   buzzer_level_high_ = false;
   last_toggle_ms_ = 0;
   last_update_call_ms_ = 0;
+  last_object_seen_ms_ = 0;
 
   printf("[GPIO] Released.\n");
 }

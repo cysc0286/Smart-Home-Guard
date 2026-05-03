@@ -95,7 +95,7 @@ class ControllerConfig:
     snapshot_source: str = "serial"
     snapshot_url: str = "http://192.168.1.88:8081/?action=snapshot"
     snapshot_file: str = "latest_snapshot.pgm"
-    serial_port: str = "COM3"
+    serial_port: str = "COM6"
     serial_baudrate: int = 115200
     serial_timeout_sec: float = 10.0
     serial_idle_timeout_sec: float = 0.08

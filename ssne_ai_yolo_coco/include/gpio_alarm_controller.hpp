@@ -22,6 +22,7 @@ class GpioAlarmController {
   bool buzzer_level_high_;
   long long last_toggle_ms_;
   long long last_update_call_ms_;
+  long long last_object_seen_ms_;  // 报警保持：最后一次 has_object=true 的时间戳
 
   static const uint16_t kLedPin;
   static const uint16_t kBuzzerPin;

@@ -270,6 +270,13 @@ void ConvertCropBoxesToOriginal(CocoDetectionResult* result) {
   }
 }
 
+void ConvertCropBoxesToOriginal(std::vector<std::array<float, 4>>* boxes) {
+  for (auto& box : *boxes) {
+    box[0] += static_cast<float>(coco_config::kCropOffsetX);
+    box[2] += static_cast<float>(coco_config::kCropOffsetX);
+  }
+}
+
 bool ExtractJsonInt(const std::string& json_line, const char* key, int* value) {
   const std::string token = std::string("\"") + key + "\"";
   const std::size_t key_pos = json_line.find(token);
@@ -543,6 +550,50 @@ void FilterDetectionsByZone(CocoDetectionResult* result, const GuardZone& zone) 
   result->detections.swap(filtered);
 }
 
+// 划分正常/报警检测：如果 zone 激活且 det 在 zone 内 + 类别属于报警类 -> 报警；否则正常
+void ClassifyDetections(const CocoDetectionResult& result,
+                        const GuardZone& zone,
+                        std::vector<std::array<float, 4>>* normal_boxes,
+                        std::vector<std::array<float, 4>>* alarm_boxes) {
+  normal_boxes->clear();
+  alarm_boxes->clear();
+  const std::vector<int>& alarm_ids = zone.alarm_class_ids.empty()
+      ? GuardZone::DefaultAlarmClassIds()
+      : zone.alarm_class_ids;
+
+  for (const auto& det : result.detections) {
+    bool is_alarm_class = std::find(alarm_ids.begin(), alarm_ids.end(), det.class_id) !=
+                          alarm_ids.end();
+    bool inside = zone.active && IsDetectionInsideZone(det, zone);
+    if (is_alarm_class && inside) {
+      alarm_boxes->push_back(det.box_xyxy);
+    } else {
+      normal_boxes->push_back(det.box_xyxy);
+    }
+  }
+}
+
+// Zone points are stored in 1440x1080 crop coordinates. Shift x before OSD,
+// because the OSD layer uses the full 1920x1080 image coordinates.
+void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
+  if (visualizer == nullptr) return;
+  visualizer->ClearZoneOverlay();
+  if (!zone.active) return;
+  if (zone.shape == "polygon") {
+    std::vector<std::array<int, 2>> pts;
+    pts.reserve(zone.points.size());
+    for (const auto& p : zone.points) {
+      pts.push_back({p.x + coco_config::kCropOffsetX, p.y});
+    }
+    visualizer->DrawZonePolygonBBox(pts);
+  } else {
+    visualizer->DrawZoneRect(zone.X1() + coco_config::kCropOffsetX,
+                             zone.Y1(),
+                             zone.X2() + coco_config::kCropOffsetX,
+                             zone.Y2());
+  }
+}
+
 void FilterDetectionsByAlarmClasses(CocoDetectionResult* result, const GuardZone& zone) {
   const std::vector<int>& alarm_class_ids = zone.alarm_class_ids.empty()
       ? GuardZone::DefaultAlarmClassIds()
@@ -798,7 +849,8 @@ bool SaveSnapshotToFile(const std::vector<unsigned char>& pgm, const char* path)
   return std::rename(temp_path.c_str(), path) == 0;
 }
 
-bool ApplyZoneCommand(UartControlChannel* uart, const std::string& json, GuardZone* zone) {
+bool ApplyZoneCommand(UartControlChannel* uart, const std::string& json,
+                      GuardZone* zone, VISUALIZER* visualizer) {
   GuardZone parsed;
   if (!ParseZoneJson(json, &parsed)) {
     uart->SendTextLine("ERR ZONE");
@@ -810,6 +862,7 @@ bool ApplyZoneCommand(UartControlChannel* uart, const std::string& json, GuardZo
   }
   *zone = parsed;
   printf("[ZONE] Updated: %s\n", zone->Describe().c_str());
+  RefreshZoneOverlay(visualizer, *zone);
   uart->SendTextLine("OK ZONE");
   return true;
 }
@@ -848,7 +901,8 @@ bool SendSerialSnapshot(UartControlChannel* uart,
 bool RunSerialSetup(UartControlChannel* uart,
                     IMAGEPROCESSOR* processor,
                     const std::array<int, 2>& crop_shape,
-                    GuardZone* zone) {
+                    GuardZone* zone,
+                    VISUALIZER* visualizer) {
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, zone)) {
     printf("[SETUP] Loaded existing zone: %s\n", zone->Describe().c_str());
   } else {
@@ -867,7 +921,7 @@ bool RunSerialSetup(UartControlChannel* uart,
         return false;
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
-      ApplyZoneCommand(uart, line.substr(5), zone);
+      ApplyZoneCommand(uart, line.substr(5), zone, visualizer);
     } else if (line == "START") {
       uart->SendTextLine("OK START");
       return true;
@@ -883,7 +937,8 @@ bool RunSerialSetup(UartControlChannel* uart,
 void PollRuntimeSerial(UartControlChannel* uart,
                        IMAGEPROCESSOR* processor,
                        const std::array<int, 2>& crop_shape,
-                       GuardZone* zone) {
+                       GuardZone* zone,
+                       VISUALIZER* visualizer) {
   if (uart == nullptr || !uart->IsOpen()) {
     return;
   }
@@ -896,7 +951,7 @@ void PollRuntimeSerial(UartControlChannel* uart,
         fprintf(stderr, "[UART] Failed to send runtime snapshot\n");
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
-      ApplyZoneCommand(uart, line.substr(5), zone);
+      ApplyZoneCommand(uart, line.substr(5), zone, visualizer);
     } else if (line == "START") {
       uart->SendTextLine("OK START");
     } else if (line == "QUIT") {
@@ -933,7 +988,8 @@ int main() {
   printf("[INIT] Detector loaded: %s\n", model_path.c_str());
 
   VISUALIZER visualizer;
-  visualizer.Initialize(img_shape, "shared_colorLUT.sscl");
+  // 切换到 colorLUT.sscl（21 RGB 条目）以支持白/红/黄三色 OSD 显示
+  visualizer.Initialize(img_shape, "colorLUT.sscl");
 
   GpioAlarmController gpio_alarm;
   if (!gpio_alarm.Initialize()) {
@@ -974,7 +1030,7 @@ int main() {
       return -1;
     }
 
-    if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone)) {
+    if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone, &visualizer)) {
       uart_channel.Release();
       gpio_alarm.Release();
       detector.Release();
@@ -988,6 +1044,9 @@ int main() {
     }
   }
 
+  // 启动后立即把已加载的 zone 绘制为黄色框
+  RefreshZoneOverlay(&visualizer, active_zone);
+
   std::thread listener_thread(keyboard_listener);
   SnapshotHttpServer snapshot_server(coco_config::kSnapshotHttpPort, &snapshot_buffer);
   std::thread snapshot_thread(&SnapshotHttpServer::Run, &snapshot_server);
@@ -996,21 +1055,31 @@ int main() {
   auto last_snapshot_time = std::chrono::steady_clock::now() -
                             std::chrono::milliseconds(coco_config::kSnapshotUpdateIntervalMs);
   auto fps_window_start   = std::chrono::steady_clock::now();
-  constexpr int kDetLogIntervalMs   = 500;
-  constexpr int kIdleLogIntervalMs  = 5000;
-  constexpr int kFpsLogIntervalMs   = 1000;
-  constexpr float kSensorFps        = 60.0f;
-  constexpr int kCamFailMax         = 60;  // ~1s of consecutive camera failures
-  constexpr int kInferFailMax       = 30;  // ~0.5s of consecutive inference failures
+  auto last_brightness_log = std::chrono::steady_clock::now();
+  constexpr int kDetLogIntervalMs    = 500;
+  constexpr int kIdleLogIntervalMs   = 5000;
+  constexpr int kFpsLogIntervalMs    = 1000;
+  constexpr int kBrightnessLogMs     = 5000;
+  constexpr int kLatencyReportEveryN = 60;   // 每 60 帧上报一次 P95 延迟
+  constexpr float kSensorFps         = 60.0f;
+  constexpr int kCamFailMax          = 60;   // ~1s of consecutive camera failures
+  constexpr int kInferFailMax        = 30;   // ~0.5s of consecutive inference failures
+  constexpr int kDataFailMax         = 30;   // 连续数据异常阈值
 
   int fps_frame_count   = 0;
   int cam_fail_count    = 0;
   int infer_fail_count  = 0;
+  int data_fail_count   = 0;
+
+  // 端到端延迟样本环（帧捕获 -> OSD刷新），用于 P95 统计
+  std::vector<long long> latency_samples;
+  latency_samples.reserve(kLatencyReportEveryN);
 
   while (!check_exit_flag()) {
-    const auto now = std::chrono::steady_clock::now();
+    const auto loop_start = std::chrono::steady_clock::now();
+    const auto now = loop_start;
 
-    // --- 摄像头异常处理 ---
+    // --- [异常类1] 摄像头异常处理 ---
     if (!processor.GetImage(&img_sensor)) {
       ++cam_fail_count;
       if (cam_fail_count == 1) {
@@ -1028,8 +1097,48 @@ int main() {
     }
     cam_fail_count = 0;
 
+    // --- [异常类2] 数据异常处理 ---
+    // 校验张量数据指针、维度合法性
+    {
+      void* data_ptr = get_data(img_sensor);
+      const bool data_invalid = (data_ptr == nullptr);
+      if (data_invalid) {
+        ++data_fail_count;
+        if (data_fail_count == 1) {
+          fprintf(stderr, "[DATA][ALARM] Invalid sensor tensor (null data)\n");
+        }
+        if (data_fail_count >= kDataFailMax) {
+          fprintf(stderr, "[DATA][ALARM] Persistent data corruption, restarting pipeline\n");
+          processor.Release();
+          usleep(200000);
+          processor.Initialize(&img_shape);
+          data_fail_count = 0;
+        }
+        continue;
+      }
+      data_fail_count = 0;
+
+      // 亮度统计 (鲁棒性): 采样 UYVY 中的 Y 通道
+      const auto bright_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - last_brightness_log).count();
+      if (bright_elapsed_ms >= kBrightnessLogMs) {
+        const unsigned char* src = static_cast<const unsigned char*>(data_ptr);
+        const int sample_count = 256;
+        long sum = 0;
+        const int total_pixels = crop_shape[0] * crop_shape[1];
+        for (int i = 0; i < sample_count; ++i) {
+          const int p = (i * total_pixels) / sample_count;
+          sum += src[p * 2 + 1];
+        }
+        const int avg_y = static_cast<int>(sum / sample_count);
+        const char* level = avg_y < 40 ? "DARK" : (avg_y > 200 ? "BRIGHT" : "OK");
+        printf("[ENV]  avg_luma=%d  level=%s\n", avg_y, level);
+        last_brightness_log = now;
+      }
+    }
+
     if (coco_config::kEnableSerialSetup) {
-      PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone);
+      PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone, &visualizer);
     }
 
     ++fps_frame_count;
@@ -1060,7 +1169,7 @@ int main() {
       last_snapshot_time = now;
     }
 
-    // --- 推理异常处理 ---
+    // --- [异常类3] 推理异常处理 ---
     if (!detector.Predict(&img_sensor, &det_result, coco_config::kConfThreshold)) {
       ++infer_fail_count;
       fprintf(stderr, "[INFER][ALARM] Inference failed (%d consecutive)\n", infer_fail_count);
@@ -1072,25 +1181,49 @@ int main() {
     }
     infer_fail_count = 0;
 
-    FilterDetectionsByZone(&det_result, active_zone);
+    // Keep detections in crop coordinates through tracking and zone judgement.
+    // The PC planner also sends zone coordinates in the 1440x1080 crop space.
     FilterDetectionsByAlarmClasses(&det_result, active_zone);
-    ConvertCropBoxesToOriginal(&det_result);
 
     tracker.Update(det_result);
-    CocoDetectionResult stable = tracker.ConfirmedDetections();
+    CocoDetectionResult stable_crop = tracker.ConfirmedDetections();
 
-    const bool has_object = !stable.detections.empty();
-    gpio_alarm.Update(has_object);
+    // Zone judgement is done in crop coordinates; display/log coordinates are
+    // shifted back to the full 1920x1080 OSD coordinate space afterwards.
+    std::vector<std::array<float, 4>> normal_boxes;
+    std::vector<std::array<float, 4>> alarm_boxes;
+    ClassifyDetections(stable_crop, active_zone, &normal_boxes, &alarm_boxes);
+    ConvertCropBoxesToOriginal(&normal_boxes);
+    ConvertCropBoxesToOriginal(&alarm_boxes);
+
+    CocoDetectionResult stable_display = stable_crop;
+    ConvertCropBoxesToOriginal(&stable_display);
+
+    const bool has_object       = !stable_crop.detections.empty();
+    const bool is_alarm_active  = !alarm_boxes.empty();
+
+    // GPIO 报警仅在 zone 内触发（更准确反映安防意图）
+    gpio_alarm.Update(is_alarm_active);
+
+    // 显示/隐藏英文 ALERT 报警位图
+    if (is_alarm_active) {
+      visualizer.ShowAlarmIndicator(coco_config::kAlarmBitmapPosX, coco_config::kAlarmBitmapPosY);
+    } else {
+      visualizer.HideAlarmIndicator();
+    }
 
     const auto log_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_log_time).count();
     const int log_interval = has_object ? kDetLogIntervalMs : kIdleLogIntervalMs;
     if (log_elapsed_ms >= log_interval) {
       if (has_object) {
-        for (const auto& det : stable.detections) {
+        for (const auto& det : stable_display.detections) {
           printf("[DET]  %-10s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n",
                  det.label.c_str(), det.score,
                  det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+        }
+        if (is_alarm_active) {
+          printf("[ALARM] %zu object(s) inside danger zone\n", alarm_boxes.size());
         }
       } else {
         printf("[IDLE] no detection\n");
@@ -1098,7 +1231,23 @@ int main() {
       last_log_time = now;
     }
 
-    visualizer.Draw(tracker.ConfirmedBoxes());
+    visualizer.DrawDetections(normal_boxes, alarm_boxes);
+
+    // 端到端延迟统计 (帧捕获 -> 绘制完成)
+    const auto loop_end = std::chrono::steady_clock::now();
+    const long long latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        loop_end - loop_start).count();
+    latency_samples.push_back(latency_ms);
+    if (static_cast<int>(latency_samples.size()) >= kLatencyReportEveryN) {
+      std::vector<long long> sorted = latency_samples;
+      std::sort(sorted.begin(), sorted.end());
+      const long long p50 = sorted[sorted.size() * 50 / 100];
+      const long long p95 = sorted[sorted.size() * 95 / 100];
+      const long long p99 = sorted[sorted.size() * 99 / 100];
+      printf("[LAT]  p50=%lldms  p95=%lldms  p99=%lldms  (n=%zu)\n",
+             p50, p95, p99, sorted.size());
+      latency_samples.clear();
+    }
   }
 
   if (listener_thread.joinable()) {

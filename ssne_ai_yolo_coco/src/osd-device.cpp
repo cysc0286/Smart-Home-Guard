@@ -48,9 +48,7 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
     // init osd (必须在创建图层前调用)
     osd_init_device(m_osd_handle, OSD_LAYER_SIZE, (char*)m_pcolor_lut);
 
-    // init quad-rangle layer (TYPE_GRAPHIC) for layers 0-1
-    // 1024 is sufficient for small face boxes but not for full-body person boxes
-    // (row-level encoding ~4 bytes/row * 1080 rows = ~4320 bytes needed)
+    // Layer 0/1: TYPE_GRAPHIC (检测框 + 危险区域框)
     int dma_size = 0x8000;  // 32KB
     for(int layer_index = 0; layer_index < 2; layer_index++){
         osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, dma_size);sleep(0.25);
@@ -70,7 +68,30 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
     }
 
-    // 只使用2个GRAPHIC层(0和1)画矩形框，不创建IMAGE层
+    // Layer 2: TYPE_IMAGE / SS_TYPE_RLE (英文ALERT位图)
+    {
+        const int alarm_dma_size = 0x20000;  // 128KB for RLE bitmap
+        osd_alloc_buffer(m_osd_handle, m_layer_dma[2].dma, alarm_dma_size);sleep(0.25);
+        osd_alloc_buffer(m_osd_handle, m_layer_dma[2].dma_2, alarm_dma_size);
+        int dma_fd = osd_get_buffer_fd(m_osd_handle, m_layer_dma[2].dma);
+
+        LAYER_ATTR_S osd_layer;
+        osd_layer.codeTYPE = SS_TYPE_RLE;
+        osd_layer.layer_data_RLE.osd_buf.buf_type = BUFFER_TYPE_DMABUF;
+        osd_layer.layer_data_RLE.osd_buf.buf.fd_dmabuf = dma_fd;
+        osd_layer.layerStart.layer_start_x = 0;
+        osd_layer.layerStart.layer_start_y = 0;
+        osd_layer.layerSize.layer_width = m_width;
+        osd_layer.layerSize.layer_height = m_height;
+        osd_layer.layer_rgn = {TYPE_IMAGE, {m_width, m_height}};
+        osd_create_layer(m_osd_handle, (ssLAYER_HANDLE)2, &osd_layer);
+        osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)2, m_layer_dma[2]);
+    }
+}
+
+void OsdDevice::ClearLayer(int layer_id){
+    if (layer_id < 0 || layer_id >= OSD_LAYER_SIZE) return;
+    osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
 }
 
 

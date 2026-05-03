@@ -34,6 +34,19 @@ static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 500;
+static const int   kAlarmHoldMs     = 1500;   // 报警保持：检测丢失后蜂鸣器/LED 仍持续 1.5s
+
+// OSD color LUT indices (colorLUT.sscl). Tweak if the rendered hue does not match.
+static const int   kColorAlarmBox   = 0;   // Red    - object inside danger zone
+static const int   kColorNormalBox  = 1;   // Green  - normal detection ("white" alternative)
+static const int   kColorZoneBox    = 3;   // Yellow - danger zone outline
+static const int   kZoneBorderPx    = 5;   // 危险区域黄框线宽
+static const int   kBoxBorderPx     = 5;   // 检测框线宽：3 -> 5，大框轮廓更醒目
+
+// Alarm indicator bitmap (English ALERT). Shown top-left when alarm is active.
+static const char* kAlarmBitmapName = "alert.ssbmp";
+static const int   kAlarmBitmapPosX = 30;
+static const int   kAlarmBitmapPosY = 30;
 
 static const std::array<int, 3> kStrides = {8, 16, 32};
 

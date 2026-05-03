@@ -1,8 +1,27 @@
 {
   "type": "zone_update",
-  "shape": "rect",
-  "x1": 383,
-  "y1": 126,
-  "x2": 989,
-  "y2": 559
+  "shape": "polygon",
+  "points": [
+    [
+      164,
+      128
+    ],
+    [
+      1336,
+      122
+    ],
+    [
+      1347,
+      1032
+    ],
+    [
+      176,
+      1022
+    ]
+  ],
+  "alarm_classes": [
+    "person",
+    "dog",
+    "cat"
+  ]
 }

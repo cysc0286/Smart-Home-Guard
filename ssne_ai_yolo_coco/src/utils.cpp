@@ -6,6 +6,7 @@
  * @Copyright (c) 2025 SmartSens
  */
 #include "../include/utils.hpp"
+#include "../include/coco_config.hpp"
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -272,37 +273,89 @@ void VISUALIZER::Draw() {
 }
 
 /**
- * @brief 根据检测框绘制OSD矩形
- * @param boxes 检测框向量，每个元素为[xmin, ymin, xmax, ymax]
- * @description 将所有检测到的人脸框绘制到OSD显示层（使用layer 0，不影响固定正方形所在的layer 1）
+ * @brief 单色检测框绘制（向后兼容旧调用），全部使用 Normal 颜色（白/绿）
  */
 void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
+    DrawDetections(boxes, {});
+}
 
-    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;  // OSD矩形框向量
+/**
+ * @brief 同帧绘制正常框 + 报警框到 layer 0，不同 q.color 区分颜色
+ */
+void VISUALIZER::DrawDetections(const std::vector<std::array<float, 4>>& normal_boxes,
+                                const std::vector<std::array<float, 4>>& alarm_boxes) {
+    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
 
-    // 遍历所有检测框，转换为OSD矩形格式
-    for (size_t i = 0; i < boxes.size(); i++) {
-        sst::device::osd::OsdQuadRangle q;
+    auto append = [&](const std::vector<std::array<float, 4>>& boxes, int color_idx) {
+        for (const auto& b : boxes) {
+            sst::device::osd::OsdQuadRangle q;
+            q.box = {b[0], b[1], b[2], b[3]};
+            q.color = color_idx;
+            q.border = coco_config::kBoxBorderPx;
+            q.alpha = fdevice::TYPE_ALPHA100;
+            q.type = fdevice::TYPE_HOLLOW;
+            q.layer_id = DETECTION_LAYER_ID;
+            quad_rangle_vec.emplace_back(q);
+        }
+    };
+    append(normal_boxes, coco_config::kColorNormalBox);
+    append(alarm_boxes,  coco_config::kColorAlarmBox);
 
-        // 将检测框坐标从float转换为int [xmin, ymin, xmax, ymax]
-        int xmin = static_cast<int>(boxes[i][0]);  // 左上角x坐标
-        int ymin = static_cast<int>(boxes[i][1]);  // 左上角y坐标
-        int xmax = static_cast<int>(boxes[i][2]);  // 右下角x坐标
-        int ymax = static_cast<int>(boxes[i][3]);  // 右下角y坐标
-
-        q.box = {xmin, ymin, xmax, ymax};  // 设置矩形框坐标
-
-        // 设置矩形框样式参数
-        q.color = 2;                         // 颜色索引1（不同于测试框）
-        q.border = 3;                        // 边框宽度3像素
-        q.alpha = fdevice::TYPE_ALPHA75;     // 透明度75%
-        q.type = fdevice::TYPE_HOLLOW;       // 空心矩形
-        q.layer_id = DETECTION_LAYER_ID;     // 使用layer 0，避免影响固定正方形的layer 1
-        quad_rangle_vec.emplace_back(q);     // 添加到矩形框向量
-    }
-    // 调用OSD设备绘制所有矩形框到指定图层（layer 0）
-    // 使用指定图层版本，避免清除所有图层（包括layer 1的固定正方形）
     osd_device.Draw(quad_rangle_vec, DETECTION_LAYER_ID);
+}
+
+/**
+ * @brief 在 layer 1 画黄色 hollow 危险区域矩形
+ */
+void VISUALIZER::DrawZoneRect(int x1, int y1, int x2, int y2) {
+    if (x1 > x2) std::swap(x1, x2);
+    if (y1 > y2) std::swap(y1, y2);
+    x1 = std::max(0, std::min(x1, m_width - 1));
+    y1 = std::max(0, std::min(y1, m_height - 1));
+    x2 = std::max(0, std::min(x2, m_width - 1));
+    y2 = std::max(0, std::min(y2, m_height - 1));
+
+    std::vector<std::array<float, 4>> boxes;
+    boxes.push_back({static_cast<float>(x1), static_cast<float>(y1),
+                     static_cast<float>(x2), static_cast<float>(y2)});
+    osd_device.Draw(boxes,
+                    coco_config::kZoneBorderPx,
+                    ZONE_LAYER_ID,
+                    fdevice::TYPE_HOLLOW,
+                    fdevice::TYPE_ALPHA100,
+                    coco_config::kColorZoneBox);
+}
+
+void VISUALIZER::DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& points) {
+    if (points.size() < 3) return;
+    int xmin = points[0][0];
+    int ymin = points[0][1];
+    int xmax = xmin;
+    int ymax = ymin;
+    for (const auto& p : points) {
+        xmin = std::min(xmin, p[0]);
+        ymin = std::min(ymin, p[1]);
+        xmax = std::max(xmax, p[0]);
+        ymax = std::max(ymax, p[1]);
+    }
+    DrawZoneRect(xmin, ymin, xmax, ymax);
+}
+
+void VISUALIZER::ClearZoneOverlay() {
+    osd_device.ClearLayer(ZONE_LAYER_ID);
+}
+
+void VISUALIZER::ShowAlarmIndicator(int pos_x, int pos_y) {
+    if (m_alarm_indicator_visible) return;
+    const std::string path = "/app_demo/app_assets/" + std::string(coco_config::kAlarmBitmapName);
+    osd_device.DrawTexture(path.c_str(), nullptr, ALARM_LAYER_ID, pos_x, pos_y);
+    m_alarm_indicator_visible = true;
+}
+
+void VISUALIZER::HideAlarmIndicator() {
+    if (!m_alarm_indicator_visible) return;
+    osd_device.ClearLayer(ALARM_LAYER_ID);
+    m_alarm_indicator_visible = false;
 }
 /**
  * @brief 绘制固定实心正方形
