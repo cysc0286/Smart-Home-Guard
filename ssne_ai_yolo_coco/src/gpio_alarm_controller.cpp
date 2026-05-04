@@ -90,6 +90,10 @@ void GpioAlarmController::SetBuzzer(bool on) {
 }
 
 void GpioAlarmController::Update(bool has_object) {
+  Update(has_object, coco_config::kAlarmHoldMs);
+}
+
+void GpioAlarmController::Update(bool has_object, int hold_ms) {
   if (!initialized_) {
     return;
   }
@@ -104,7 +108,7 @@ void GpioAlarmController::Update(bool has_object) {
   }
   const bool alarm_active = has_object ||
       (last_object_seen_ms_ > 0 &&
-       (now_ms - last_object_seen_ms_) < coco_config::kAlarmHoldMs);
+       (now_ms - last_object_seen_ms_) < hold_ms);
 
   if (!alarm_active) {
     SetLed(false);

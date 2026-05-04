@@ -12,6 +12,7 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -41,6 +42,126 @@ struct SnapshotBuffer {
   bool ready = false;
   std::mutex mutex;
 };
+
+enum class EnvPolicy {
+  kNormal,
+  kLowLight,
+  kBright
+};
+
+struct EnvPolicyState {
+  EnvPolicy policy = EnvPolicy::kNormal;
+  int avg_luma = 0;
+  int dark_votes = 0;
+  int bright_votes = 0;
+  float conf_threshold = coco_config::kConfThreshold;
+  int alarm_hold_ms = coco_config::kAlarmHoldMs;
+};
+
+struct AcceptanceStats {
+  int frames = 0;
+  int detection_frames = 0;
+  int alarm_frames = 0;
+  int detections = 0;
+  int alarm_detections = 0;
+  int camera_recoveries = 0;
+  int data_recoveries = 0;
+  int infer_failures = 0;
+  int resource_warnings = 0;
+  bool summary_printed = false;
+  std::vector<long long> latency_ms;
+};
+
+const char* BoolText(bool value) {
+  return value ? "ON" : "OFF";
+}
+
+const char* EnvPolicyName(EnvPolicy policy) {
+  switch (policy) {
+    case EnvPolicy::kLowLight: return "LOW_LIGHT";
+    case EnvPolicy::kBright: return "BRIGHT";
+    case EnvPolicy::kNormal:
+    default: return "NORMAL";
+  }
+}
+
+bool FileReadable(const std::string& path) {
+  return access(path.c_str(), R_OK) == 0;
+}
+
+int EstimateFpsScore(float ratio) {
+  const float clipped = std::max(0.0f, std::min(ratio, 1.0f));
+  return static_cast<int>(std::floor(10.0f * clipped));
+}
+
+float ToFramePeriods(long long latency_ms, float sensor_fps) {
+  const float frame_period_ms = 1000.0f / sensor_fps;
+  return static_cast<float>(latency_ms) / frame_period_ms;
+}
+
+int EstimateLatencyScore(long long p95_ms, float sensor_fps) {
+  const float periods = ToFramePeriods(p95_ms, sensor_fps);
+  if (periods > 11.0f) return 0;
+  return std::max(0, static_cast<int>(std::floor(11.0f - periods)));
+}
+
+long long PercentileMs(std::vector<long long> samples, int percentile) {
+  if (samples.empty()) return 0;
+  std::sort(samples.begin(), samples.end());
+  const size_t idx = std::min(
+      samples.size() - 1,
+      static_cast<size_t>(samples.size() * static_cast<size_t>(percentile) / 100u));
+  return samples[idx];
+}
+
+int SampleAverageLuma(const void* data_ptr, const std::array<int, 2>& crop_shape) {
+  if (data_ptr == nullptr) return 0;
+  const unsigned char* src = static_cast<const unsigned char*>(data_ptr);
+  const int sample_count = 256;
+  const int total_pixels = crop_shape[0] * crop_shape[1];
+  long sum = 0;
+  for (int i = 0; i < sample_count; ++i) {
+    const int p = (i * total_pixels) / sample_count;
+    sum += src[p * 2 + 1];
+  }
+  return static_cast<int>(sum / sample_count);
+}
+
+bool UpdateEnvPolicy(int avg_luma, EnvPolicyState* state) {
+  const EnvPolicy previous = state->policy;
+  state->avg_luma = avg_luma;
+
+  if (avg_luma < coco_config::kEnvLowLightY) {
+    state->dark_votes++;
+    state->bright_votes = 0;
+  } else if (avg_luma > coco_config::kEnvBrightY) {
+    state->bright_votes++;
+    state->dark_votes = 0;
+  } else {
+    state->dark_votes = 0;
+    state->bright_votes = 0;
+    state->policy = EnvPolicy::kNormal;
+  }
+
+  if (state->dark_votes >= coco_config::kEnvPolicyStableSamples) {
+    state->policy = EnvPolicy::kLowLight;
+  } else if (state->bright_votes >= coco_config::kEnvPolicyStableSamples) {
+    state->policy = EnvPolicy::kBright;
+  }
+
+  if (state->policy == EnvPolicy::kLowLight) {
+    state->conf_threshold = coco_config::kLowLightConfThreshold;
+    state->alarm_hold_ms = coco_config::kLowLightAlarmHoldMs;
+  } else if (state->policy == EnvPolicy::kBright) {
+    state->conf_threshold = coco_config::kBrightConfThreshold;
+    state->alarm_hold_ms = coco_config::kAlarmHoldMs;
+  } else {
+    state->conf_threshold = coco_config::kConfThreshold;
+    state->alarm_hold_ms = coco_config::kAlarmHoldMs;
+  }
+
+  return previous != state->policy;
+}
 
 struct ZonePoint {
   int x;
@@ -979,27 +1100,47 @@ int main() {
   processor.Initialize(&img_shape);
 
   COCO_DETECTOR detector;
-  if (!detector.Initialize(model_path, &crop_shape, &det_shape)) {
-    fprintf(stderr, "[RESOURCE][ALARM] Detector init failed, aborting.\n");
-    processor.Release();
-    ssne_release();
-    return -1;
+  AcceptanceStats accept_stats;
+  bool detector_ready = false;
+  if (!FileReadable(model_path)) {
+    ++accept_stats.resource_warnings;
+    fprintf(stderr, "[RESOURCE][ALARM] model missing: %s; detection disabled\n",
+            model_path.c_str());
+  } else if (!detector.Initialize(model_path, &crop_shape, &det_shape)) {
+    ++accept_stats.resource_warnings;
+    fprintf(stderr, "[RESOURCE][ALARM] Detector init failed; detection disabled\n");
+  } else {
+    detector_ready = true;
+    printf("[INIT] Detector loaded: %s\n", model_path.c_str());
   }
-  printf("[INIT] Detector loaded: %s\n", model_path.c_str());
 
   VISUALIZER visualizer;
+  const std::string color_lut_path = "/app_demo/app_assets/colorLUT.sscl";
+  if (!FileReadable(color_lut_path)) {
+    ++accept_stats.resource_warnings;
+    fprintf(stderr, "[RESOURCE][WARN] color LUT missing: %s; OSD will try default path\n",
+            color_lut_path.c_str());
+  }
   // 切换到 colorLUT.sscl（21 RGB 条目）以支持白/红/黄三色 OSD 显示
   visualizer.Initialize(img_shape, "colorLUT.sscl");
 
-  GpioAlarmController gpio_alarm;
-  if (!gpio_alarm.Initialize()) {
-    visualizer.Release();
-    detector.Release();
-    processor.Release();
-    ssne_release();
-    return -1;
+  const std::string alert_bitmap_path =
+      "/app_demo/app_assets/" + std::string(coco_config::kAlarmBitmapName);
+  const bool alert_bitmap_ready = FileReadable(alert_bitmap_path);
+  if (!alert_bitmap_ready) {
+    ++accept_stats.resource_warnings;
+    fprintf(stderr, "[RESOURCE][WARN] alert bitmap missing: %s; bitmap alarm disabled\n",
+            alert_bitmap_path.c_str());
   }
-  printf("[INIT] GPIO alarm ready\n");
+
+  GpioAlarmController gpio_alarm;
+  bool gpio_ready = gpio_alarm.Initialize();
+  if (!gpio_ready) {
+    ++accept_stats.resource_warnings;
+    fprintf(stderr, "[RESOURCE][WARN] GPIO alarm disabled; detection/OSD will continue\n");
+  } else {
+    printf("[INIT] GPIO alarm ready\n");
+  }
 
   usleep(200000);
   printf("[INIT] System ready -- input q to quit\n");
@@ -1017,30 +1158,29 @@ int main() {
     printf("[ZONE] No zone config found, detections will run without zone filtering\n");
   }
 
+  bool uart_ready = false;
   if (coco_config::kEnableSerialSetup) {
     if (!uart_channel.Initialize(coco_config::kSerialBaudrate)) {
-      gpio_alarm.Release();
-      detector.Release();
-      processor.Release();
-      visualizer.Release();
-      if (ssne_release()) {
-        fprintf(stderr, "SSNE release failed!\n");
-        return -1;
+      ++accept_stats.resource_warnings;
+      fprintf(stderr, "[RESOURCE][WARN] UART setup disabled; using existing/default zone\n");
+    } else {
+      uart_ready = true;
+      if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone, &visualizer)) {
+        if (check_exit_flag()) {
+          uart_channel.Release();
+          if (gpio_ready) gpio_alarm.Release();
+          if (detector_ready) detector.Release();
+          processor.Release();
+          visualizer.Release();
+          if (ssne_release()) {
+            fprintf(stderr, "SSNE release failed!\n");
+            return -1;
+          }
+          return 0;
+        }
+        ++accept_stats.resource_warnings;
+        fprintf(stderr, "[RESOURCE][WARN] Serial setup incomplete; continuing run mode\n");
       }
-      return -1;
-    }
-
-    if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone, &visualizer)) {
-      uart_channel.Release();
-      gpio_alarm.Release();
-      detector.Release();
-      processor.Release();
-      visualizer.Release();
-      if (ssne_release()) {
-        fprintf(stderr, "SSNE release failed!\n");
-        return -1;
-      }
-      return 0;
     }
   }
 
@@ -1053,15 +1193,16 @@ int main() {
 
   auto last_log_time      = std::chrono::steady_clock::now();
   auto last_snapshot_time = std::chrono::steady_clock::now() -
-                            std::chrono::milliseconds(coco_config::kSnapshotUpdateIntervalMs);
+                            std::chrono::milliseconds(coco_config::kRunSnapshotUpdateIntervalMs);
   auto fps_window_start   = std::chrono::steady_clock::now();
   auto last_brightness_log = std::chrono::steady_clock::now();
-  constexpr int kDetLogIntervalMs    = 500;
+  auto acceptance_start    = std::chrono::steady_clock::now();
+  constexpr int kDetLogIntervalMs    = coco_config::kDetectionSummaryLogMs;
   constexpr int kIdleLogIntervalMs   = 5000;
   constexpr int kFpsLogIntervalMs    = 1000;
-  constexpr int kBrightnessLogMs     = 5000;
+  constexpr int kBrightnessLogMs     = coco_config::kEnvLogIntervalMs;
   constexpr int kLatencyReportEveryN = 60;   // 每 60 帧上报一次 P95 延迟
-  constexpr float kSensorFps         = 60.0f;
+  constexpr float kSensorFps         = 45.0f;  // SC235HAI Task1: 1920x1080@45fps
   constexpr int kCamFailMax          = 60;   // ~1s of consecutive camera failures
   constexpr int kInferFailMax        = 30;   // ~0.5s of consecutive inference failures
   constexpr int kDataFailMax         = 30;   // 连续数据异常阈值
@@ -1070,10 +1211,32 @@ int main() {
   int cam_fail_count    = 0;
   int infer_fail_count  = 0;
   int data_fail_count   = 0;
+  EnvPolicyState env_state;
 
   // 端到端延迟样本环（帧捕获 -> OSD刷新），用于 P95 统计
   std::vector<long long> latency_samples;
   latency_samples.reserve(kLatencyReportEveryN);
+
+  printf("[CHECK][BEGIN] duration=%dms mode=%s sensor_fps=%.0f det=%dx%d\n",
+         coco_config::kAcceptanceDurationMs,
+         coco_config::kEnableAcceptanceMode ? "ACCEPT" : "NORMAL",
+         kSensorFps,
+         det_shape[0],
+         det_shape[1]);
+  printf("[CHECK][FEATURE] detect=%s zone=%s osd=ON gpio=%s uart=%s snapshot=MEM%s env=ON exceptions=ON\n",
+         BoolText(detector_ready),
+         active_zone.active ? active_zone.shape.c_str() : "OFF",
+         BoolText(gpio_ready),
+         BoolText(uart_ready),
+         coco_config::kSaveSnapshotFileInRun ? "+FILE" : "");
+  if (accept_stats.resource_warnings > 0) {
+    printf("[CHECK][DEGRADE] resource_warnings=%d detector=%s gpio=%s uart=%s alert_bitmap=%s\n",
+           accept_stats.resource_warnings,
+           BoolText(detector_ready),
+           BoolText(gpio_ready),
+           BoolText(uart_ready),
+           BoolText(alert_bitmap_ready));
+  }
 
   while (!check_exit_flag()) {
     const auto loop_start = std::chrono::steady_clock::now();
@@ -1091,6 +1254,7 @@ int main() {
         processor.Release();
         usleep(200000);
         processor.Initialize(&img_shape);
+        ++accept_stats.camera_recoveries;
         cam_fail_count = 0;
       }
       continue;
@@ -1112,6 +1276,7 @@ int main() {
           processor.Release();
           usleep(200000);
           processor.Initialize(&img_shape);
+          ++accept_stats.data_recoveries;
           data_fail_count = 0;
         }
         continue;
@@ -1122,39 +1287,38 @@ int main() {
       const auto bright_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           now - last_brightness_log).count();
       if (bright_elapsed_ms >= kBrightnessLogMs) {
-        const unsigned char* src = static_cast<const unsigned char*>(data_ptr);
-        const int sample_count = 256;
-        long sum = 0;
-        const int total_pixels = crop_shape[0] * crop_shape[1];
-        for (int i = 0; i < sample_count; ++i) {
-          const int p = (i * total_pixels) / sample_count;
-          sum += src[p * 2 + 1];
-        }
-        const int avg_y = static_cast<int>(sum / sample_count);
-        const char* level = avg_y < 40 ? "DARK" : (avg_y > 200 ? "BRIGHT" : "OK");
-        printf("[ENV]  avg_luma=%d  level=%s\n", avg_y, level);
+        const int avg_y = SampleAverageLuma(data_ptr, crop_shape);
+        const bool policy_changed = UpdateEnvPolicy(avg_y, &env_state);
+        printf("[ENV]  avg_luma=%d  policy=%s  conf=%.2f  hold=%dms%s\n",
+               avg_y,
+               EnvPolicyName(env_state.policy),
+               env_state.conf_threshold,
+               env_state.alarm_hold_ms,
+               policy_changed ? "  changed=1" : "");
         last_brightness_log = now;
       }
     }
 
-    if (coco_config::kEnableSerialSetup) {
+    if (uart_ready) {
       PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone, &visualizer);
     }
 
     ++fps_frame_count;
+    ++accept_stats.frames;
     const auto fps_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - fps_window_start).count();
     if (fps_elapsed_ms >= kFpsLogIntervalMs) {
       const float fps_app = fps_frame_count * 1000.0f / static_cast<float>(fps_elapsed_ms);
       const float ratio   = fps_app / kSensorFps;
-      printf("[FPS]  app=%.1f  sensor=%.0f  R=%.2f\n", fps_app, kSensorFps, ratio);
+      printf("[FPS]  app=%.1f  sensor=%.0f  R=%.2f  score_est=%d\n",
+             fps_app, kSensorFps, ratio, EstimateFpsScore(ratio));
       fps_frame_count  = 0;
       fps_window_start = now;
     }
 
     const auto snapshot_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_snapshot_time).count();
-    if (snapshot_elapsed_ms >= coco_config::kSnapshotUpdateIntervalMs) {
+    if (snapshot_elapsed_ms >= coco_config::kRunSnapshotUpdateIntervalMs) {
       std::vector<unsigned char> pgm = BuildPgmSnapshot(img_sensor, crop_shape);
       {
         std::lock_guard<std::mutex> lock(snapshot_buffer.mutex);
@@ -1163,23 +1327,30 @@ int main() {
         snapshot_buffer.height = crop_shape[1];
         snapshot_buffer.ready  = true;
       }
-      if (!SaveSnapshotToFile(pgm, coco_config::kSnapshotFilePath)) {
+      if (coco_config::kSaveSnapshotFileInRun &&
+          !SaveSnapshotToFile(pgm, coco_config::kSnapshotFilePath)) {
+        ++accept_stats.resource_warnings;
         printf("[SNAPSHOT] failed to save %s\n", coco_config::kSnapshotFilePath);
       }
       last_snapshot_time = now;
     }
 
     // --- [异常类3] 推理异常处理 ---
-    if (!detector.Predict(&img_sensor, &det_result, coco_config::kConfThreshold)) {
-      ++infer_fail_count;
-      fprintf(stderr, "[INFER][ALARM] Inference failed (%d consecutive)\n", infer_fail_count);
-      if (infer_fail_count >= kInferFailMax) {
-        fprintf(stderr, "[INFER][ALARM] Too many inference failures, skipping OSD this cycle\n");
+    if (detector_ready) {
+      if (!detector.Predict(&img_sensor, &det_result, env_state.conf_threshold)) {
+        ++infer_fail_count;
+        ++accept_stats.infer_failures;
+        fprintf(stderr, "[INFER][ALARM] Inference failed (%d consecutive)\n", infer_fail_count);
+        if (infer_fail_count >= kInferFailMax) {
+          fprintf(stderr, "[INFER][ALARM] Too many inference failures, skipping OSD this cycle\n");
+        }
+        visualizer.Draw({});
+        continue;
       }
-      visualizer.Draw({});
-      continue;
+      infer_fail_count = 0;
+    } else {
+      det_result.Clear();
     }
-    infer_fail_count = 0;
 
     // Keep detections in crop coordinates through tracking and zone judgement.
     // The PC planner also sends zone coordinates in the 1440x1080 crop space.
@@ -1201,12 +1372,22 @@ int main() {
 
     const bool has_object       = !stable_crop.detections.empty();
     const bool is_alarm_active  = !alarm_boxes.empty();
+    if (has_object) {
+      ++accept_stats.detection_frames;
+      accept_stats.detections += static_cast<int>(stable_crop.detections.size());
+    }
+    if (is_alarm_active) {
+      ++accept_stats.alarm_frames;
+      accept_stats.alarm_detections += static_cast<int>(alarm_boxes.size());
+    }
 
     // GPIO 报警仅在 zone 内触发（更准确反映安防意图）
-    gpio_alarm.Update(is_alarm_active);
+    if (gpio_ready) {
+      gpio_alarm.Update(is_alarm_active, env_state.alarm_hold_ms);
+    }
 
     // 显示/隐藏英文 ALERT 报警位图
-    if (is_alarm_active) {
+    if (is_alarm_active && alert_bitmap_ready) {
       visualizer.ShowAlarmIndicator(coco_config::kAlarmBitmapPosX, coco_config::kAlarmBitmapPosY);
     } else {
       visualizer.HideAlarmIndicator();
@@ -1217,10 +1398,22 @@ int main() {
     const int log_interval = has_object ? kDetLogIntervalMs : kIdleLogIntervalMs;
     if (log_elapsed_ms >= log_interval) {
       if (has_object) {
-        for (const auto& det : stable_display.detections) {
-          printf("[DET]  %-10s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n",
-                 det.label.c_str(), det.score,
-                 det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+        if (coco_config::kVerboseDetectionLog) {
+          for (const auto& det : stable_display.detections) {
+            printf("[DET]  %-10s  conf=%.2f  [%.0f,%.0f,%.0f,%.0f]\n",
+                   det.label.c_str(), det.score,
+                   det.box_xyxy[0], det.box_xyxy[1], det.box_xyxy[2], det.box_xyxy[3]);
+          }
+        } else {
+          float best_score = 0.0f;
+          for (const auto& det : stable_display.detections) {
+            best_score = std::max(best_score, det.score);
+          }
+          printf("[DET]  objects=%zu  alarm=%zu  best_conf=%.2f  policy=%s\n",
+                 stable_display.detections.size(),
+                 alarm_boxes.size(),
+                 best_score,
+                 EnvPolicyName(env_state.policy));
         }
         if (is_alarm_active) {
           printf("[ALARM] %zu object(s) inside danger zone\n", alarm_boxes.size());
@@ -1238,15 +1431,57 @@ int main() {
     const long long latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         loop_end - loop_start).count();
     latency_samples.push_back(latency_ms);
+    accept_stats.latency_ms.push_back(latency_ms);
     if (static_cast<int>(latency_samples.size()) >= kLatencyReportEveryN) {
       std::vector<long long> sorted = latency_samples;
       std::sort(sorted.begin(), sorted.end());
       const long long p50 = sorted[sorted.size() * 50 / 100];
       const long long p95 = sorted[sorted.size() * 95 / 100];
       const long long p99 = sorted[sorted.size() * 99 / 100];
-      printf("[LAT]  p50=%lldms  p95=%lldms  p99=%lldms  (n=%zu)\n",
-             p50, p95, p99, sorted.size());
+      printf("[LAT]  p50=%lldms  p95=%lldms  p95_T=%.1f  p99=%lldms  score_est=%d  (n=%zu)\n",
+             p50,
+             p95,
+             ToFramePeriods(p95, kSensorFps),
+             p99,
+             EstimateLatencyScore(p95, kSensorFps),
+             sorted.size());
       latency_samples.clear();
+    }
+
+    if (coco_config::kEnableAcceptanceMode && !accept_stats.summary_printed) {
+      const auto accept_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          loop_end - acceptance_start).count();
+      if (accept_elapsed_ms >= coco_config::kAcceptanceDurationMs) {
+        const float runtime_sec = static_cast<float>(accept_elapsed_ms) / 1000.0f;
+        const float avg_fps = accept_stats.frames / std::max(0.001f, runtime_sec);
+        const float ratio = avg_fps / kSensorFps;
+        const long long p95 = PercentileMs(accept_stats.latency_ms, 95);
+        const char* stable_state =
+            (accept_stats.camera_recoveries == 0 &&
+             accept_stats.data_recoveries == 0 &&
+             accept_stats.infer_failures == 0) ? "PASS" : "PASS_WITH_RECOVERY";
+        printf("[CHECK][SUMMARY] runtime=%.1fs stable=%s frames=%d avg_app=%.1f R=%.2f fps_score_est=%d p95=%lldms p95_T=%.1f latency_score_est=%d\n",
+               runtime_sec,
+               stable_state,
+               accept_stats.frames,
+               avg_fps,
+               ratio,
+               EstimateFpsScore(ratio),
+               p95,
+               ToFramePeriods(p95, kSensorFps),
+               EstimateLatencyScore(p95, kSensorFps));
+        printf("[CHECK][COUNTS] det_frames=%d alarm_frames=%d detections=%d alarm_detections=%d cam_recoveries=%d data_recoveries=%d infer_failures=%d resource_warnings=%d env_policy=%s\n",
+               accept_stats.detection_frames,
+               accept_stats.alarm_frames,
+               accept_stats.detections,
+               accept_stats.alarm_detections,
+               accept_stats.camera_recoveries,
+               accept_stats.data_recoveries,
+               accept_stats.infer_failures,
+               accept_stats.resource_warnings,
+               EnvPolicyName(env_state.policy));
+        accept_stats.summary_printed = true;
+      }
     }
   }
 
@@ -1257,11 +1492,15 @@ int main() {
     snapshot_thread.join();
   }
 
-  if (coco_config::kEnableSerialSetup) {
+  if (uart_ready) {
     uart_channel.Release();
   }
-  gpio_alarm.Release();
-  detector.Release();
+  if (gpio_ready) {
+    gpio_alarm.Release();
+  }
+  if (detector_ready) {
+    detector.Release();
+  }
   processor.Release();
   visualizer.Release();
 

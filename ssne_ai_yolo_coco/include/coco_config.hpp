@@ -16,6 +16,8 @@ static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco.m1mode
 // Snapshot service for the PC-side zone planner.
 static const int   kSnapshotHttpPort      = 8081;
 static const int   kSnapshotUpdateIntervalMs = 500;
+static const int   kRunSnapshotUpdateIntervalMs = 5000;
+static const bool  kSaveSnapshotFileInRun = false;
 static const char* kSnapshotRoute         = "/?action=snapshot";
 static const char* kSnapshotAltRoute      = "/latest_snapshot.pgm";
 static const char* kSnapshotFilePath      = "/app_demo/latest_snapshot.pgm";
@@ -24,6 +26,13 @@ static const int   kSerialPreviewWidth    = 128;
 static const int   kSerialPreviewHeight   = 96;
 static const bool  kEnableSerialSetup     = true;
 static const int   kSerialBaudrate        = 115200;
+
+// Acceptance/performance mode keeps the field demo observable while reducing
+// UART/file I/O in the hot path used by scoring.
+static const bool  kEnableAcceptanceMode  = true;
+static const int   kAcceptanceDurationMs  = 60000;
+static const bool  kVerboseDetectionLog   = false;
+static const int   kDetectionSummaryLogMs = 2000;
 
 // Detection parameters
 static const int   kNumClasses      = 80;
@@ -35,6 +44,13 @@ static const int   kKeepTopK        = 30;
 static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 500;
 static const int   kAlarmHoldMs     = 1500;   // 报警保持：检测丢失后蜂鸣器/LED 仍持续 1.5s
+static const int   kLowLightAlarmHoldMs = 2500;
+static const int   kEnvLowLightY     = 40;
+static const int   kEnvBrightY       = 210;
+static const int   kEnvPolicyStableSamples = 3;
+static const int   kEnvLogIntervalMs = 2000;
+static const float kLowLightConfThreshold = 0.25f;
+static const float kBrightConfThreshold   = 0.35f;
 
 // OSD color LUT indices (colorLUT.sscl). Tweak if the rendered hue does not match.
 static const int   kColorAlarmBox   = 0;   // Red    - object inside danger zone

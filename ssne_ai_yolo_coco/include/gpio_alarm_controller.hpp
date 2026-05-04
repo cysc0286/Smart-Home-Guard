@@ -9,6 +9,7 @@ class GpioAlarmController {
 
   bool Initialize();
   void Update(bool has_object);
+  void Update(bool has_object, int hold_ms);
   void Release();
 
  private:
