@@ -199,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input-dir", default="input_videos", help="待处理视频目录")
     parser.add_argument("--output-dir", default="output_frames", help="输出图片目录")
-    parser.add_argument("--model", default="yolov8n.pt", help="YOLO 模型名称或本地模型路径")
+    parser.add_argument("--model", default="smart_guard_base.pt", help="YOLO 模型名称或本地模型路径")
     parser.add_argument("--conf", type=float, default=0.45, help="人物检测置信度阈值")
     parser.add_argument("--frame-stride", type=int, default=5, help="每隔多少帧检测一次")
     parser.add_argument(

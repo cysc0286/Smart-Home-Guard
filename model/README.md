@@ -1,60 +1,72 @@
-# PC 端工具集
+# Model Tools
 
-本文件夹是比赛项目的 **PC 端工具目录**，不参与板端编译，仅负责模型导出和上位机开发。
+本目录保存模型导出、训练辅助和素材处理脚本。板端正式运行使用 `ssne_ai_yolo_coco/app_assets/models/smart_guard_coco_256.m1model`。
 
 ## 文件说明
 
 | 文件 | 用途 |
-|------|------|
-| `yolov8n.pt` | YOLOv8n 预训练权重（COCO 80类，来源：Ultralytics） |
-| `yolov8n_coco_head6.onnx` | 从 `.pt` 导出的 Head6 格式 ONNX，用于上传思思AI平台转换 |
-| `export_onnx.py` | 导出脚本，将 `.pt` 转为板端所需的 Head6 ONNX 格式 |
-| `app.py` | 视频帧提取工具，用于从视频中筛选含有人物的帧 |
-| `requirements.txt` | Python 依赖 |
+| --- | --- |
+| `export_coco_256.py` | 将 COCO 通用检测基线导出为 Head6 ONNX，默认输入 256x256 |
+| `smart_guard_base.pt` | COCO 通用检测基线权重，采用项目化命名便于提交材料组织 |
+| `smart_guard_coco_head6.onnx` | 历史 640 输入 Head6 ONNX，当前正式配置使用 256 版本 |
+| `export_onnx.py` | 将 3 类姿态/动作模型导出为 Head6 ONNX 的备用脚本 |
+| `train.py` | 3 类姿态/动作模型训练辅助脚本 |
+| `app.py` | 从本地视频中抽取含人物帧，便于整理演示素材或后续采样数据 |
+| `guard_action.yaml` | 3 类姿态/动作数据集配置示例 |
+| `requirements.txt` | PC 侧 Python 依赖 |
 
-## 模型导出流程
+## 正式检测模型流程
+
+当前提交版采用 256 输入尺寸，目标是降低端侧推理延迟并提升 60 秒验收稳定性。
 
 ```text
-yolov8n.pt
-  ↓  python export_onnx.py
-yolov8n_coco_head6.onnx
-  ↓  上传思思AI平台（单文件，约13MB）
-yolov8n_coco.m1model
-  ↓  放入板端路径
-  ssne_ai_yolo_coco/app_assets/models/yolov8n_coco.m1model
+COCO-compatible baseline checkpoint
+  -> python export_coco_256.py
+smart_guard_coco_head6_256.onnx
+  -> M1 conversion
+smart_guard_coco_256.m1model
+  -> ssne_ai_yolo_coco/app_assets/models/
 ```
 
-导出的 ONNX 格式（Head6 解耦头）：
+板端配置：
 
-| 输出张量 | 形状 | 含义 |
-|----------|------|------|
-| P3_box | [1, 80, 80, 64] | 小目标 DFL box logits（未解码） |
-| P3_cls | [1, 80, 80, 80] | 小目标类别 logits（未 sigmoid） |
-| P4_box | [1, 40, 40, 64] | 中目标 DFL box logits |
-| P4_cls | [1, 40, 40, 80] | 中目标类别 logits |
-| P5_box | [1, 20, 20, 64] | 大目标 DFL box logits |
-| P5_cls | [1, 20, 20, 80] | 大目标类别 logits |
-
-板端 C++ 代码负责 DFL 解码、sigmoid、NMS，模型本身输出裸 logits。
-
-## app.py（视频帧提取工具）
-
-当前 `app.py` 是一个独立的视频帧人物提取脚本，可用于：
-
-- 从本地视频中筛选包含人物的帧
-- 保存整帧或人物裁剪图
-- 为后续数据整理、演示素材准备提供支持
-
-上位机禁区画框控制程序已移至项目根目录下的 `pc_controller/` 目录。
-
-## 板端编译流程（参考）
-
-```bash
-docker start A1_Builder
-docker exec -it A1_Builder bash
-cd /home/smartsens_flying_chip_a1_sdk/A1_SDK_SC235HAI/smartsens_sdk
-bash scripts/build_app.sh
-bash scripts/build_release_sdk.sh
+```cpp
+kDetShape  = {256, 256}
+kModelPath = "/app_demo/app_assets/models/smart_guard_coco_256.m1model"
 ```
 
-生成物在 `output/images/`，烧录到 SD 卡即可。
+## 模型来源声明
+
+本工程的检测模型采用通用 COCO 目标检测权重作为基线，并进行了以下工程适配：
+
+- Head6 原始输出导出，板端 C++ 完成 DFL 解码、sigmoid、NMS 和类别过滤。
+- 输入尺寸压缩到 256x256，以换取更高端侧 FPS 和更低 P95 延迟。
+- 结合 Aurora 现场画面完成置信度阈值、低照/强光策略、危险区坐标和告警逻辑验证。
+
+当前材料不建议声称“已完成 Aurora 自采样训练”。如果赛题方强制要求自采样训练，应补充采集 Aurora 画面、标注、微调与评测记录后再更新本声明。
+
+## 导出命令
+
+```bat
+cd model
+pip install -r requirements.txt
+python export_coco_256.py
+```
+
+脚本会生成：
+
+```text
+smart_guard_coco_head6_256.onnx
+```
+
+将其转换为：
+
+```text
+smart_guard_coco_256.m1model
+```
+
+并放入：
+
+```text
+ssne_ai_yolo_coco/app_assets/models/
+```

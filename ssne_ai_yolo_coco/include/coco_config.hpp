@@ -10,13 +10,14 @@ static const std::array<int, 2> kCropShape   = {1440, 1080};
 static const int                kCropOffsetX = 240;
 static const std::array<int, 2> kDetShape    = {256, 256};
 
-// Model path on the board filesystem
-static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco_256.m1model";
+// Model path on the board filesystem. The file is project-named for release
+// packaging; see model/README.md for provenance and conversion notes.
+static const char* kModelPath = "/app_demo/app_assets/models/smart_guard_coco_256.m1model";
 
 // Snapshot service for the PC-side zone planner.
 static const int   kSnapshotHttpPort      = 8081;
 static const int   kSnapshotUpdateIntervalMs = 500;
-static const int   kRunSnapshotUpdateIntervalMs = 5000;
+static const int   kRunSnapshotUpdateIntervalMs = 300000; // disabled in run mode; setup uses serial/HTTP
 static const bool  kSaveSnapshotFileInRun = false;
 static const char* kSnapshotRoute         = "/?action=snapshot";
 static const char* kSnapshotAltRoute      = "/latest_snapshot.pgm";
@@ -42,7 +43,7 @@ static const float kConfThreshold   = 0.3f;
 static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 static const int   kAlarmConfirmMs  = 800;
-static const int   kAlarmClearMs    = 500;
+static const int   kAlarmClearMs    = 0;
 static const int   kAlarmHoldMs     = 0;      // 检测丢失立即停止报警
 static const int   kLowLightAlarmHoldMs = 0;
 static const int   kEnvLowLightY     = 40;

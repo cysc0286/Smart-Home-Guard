@@ -10,7 +10,7 @@
 
 class COCO_DETECTOR {
  public:
-  std::string ModelName() const { return "yolov8n_coco_head6"; }
+  std::string ModelName() const { return "smart_guard_coco_head6"; }
 
   bool Initialize(std::string& model_path,
                   std::array<int, 2>* in_img_shape,

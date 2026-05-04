@@ -11,7 +11,7 @@ from ultralytics import YOLO
 
 MODEL_DIR = Path(__file__).parent
 DATA_YAML = MODEL_DIR / "guard_action.yaml"
-PRETRAINED = MODEL_DIR / "yolov8n.pt"
+PRETRAINED = MODEL_DIR / "smart_guard_base.pt"
 
 
 def main():

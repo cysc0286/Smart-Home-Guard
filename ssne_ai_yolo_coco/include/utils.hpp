@@ -52,6 +52,13 @@ class VISUALIZER {
      */
     void DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& points);
 
+    /**
+     * @brief 用小方块逐段拟合绘制真实多边形轮廓。
+     * 当前正式演示默认使用 DrawZonePolygonBBox() 显示外接矩形；
+     * 危险区判断仍由 demo_yolo_coco.cpp 的真实多边形算法完成。
+     */
+    void DrawZonePolygon(const std::vector<std::array<int, 2>>& points);
+
     /** 清空危险区域图层 */
     void ClearZoneOverlay();
 

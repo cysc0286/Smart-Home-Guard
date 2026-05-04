@@ -328,6 +328,8 @@ void VISUALIZER::DrawZoneRect(int x1, int y1, int x2, int y2) {
 
 void VISUALIZER::DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& points) {
     if (points.size() < 3) return;
+    // Release display mode: show the bounding rectangle of the configured
+    // polygon. The alarm decision itself still uses the exact polygon.
     int xmin = points[0][0];
     int ymin = points[0][1];
     int xmax = xmin;
@@ -339,6 +341,69 @@ void VISUALIZER::DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& poin
         ymax = std::max(ymax, p[1]);
     }
     DrawZoneRect(xmin, ymin, xmax, ymax);
+}
+
+void VISUALIZER::DrawZonePolygon(const std::vector<std::array<int, 2>>& points) {
+    if (points.size() < 3) return;
+
+    // Draw polygon outline as small solid squares sampled along each edge.
+    // Step size is computed dynamically from total perimeter so total quads
+    // never exceeds MAX_QUADS, staying safely within the 32 KB DMA buffer.
+    const int T = coco_config::kZoneBorderPx;
+    const int MAX_QUADS = 450;
+    const std::size_t n = points.size();
+
+    // Chebyshev perimeter (avoids sqrt, good enough for step sizing)
+    int total_len = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        int dx = points[(i + 1) % n][0] - points[i][0];
+        int dy = points[(i + 1) % n][1] - points[i][1];
+        total_len += std::max(std::abs(dx), std::abs(dy));
+    }
+    if (total_len == 0) return;
+
+    // step >= T so squares tile tightly; increases automatically for large polygons
+    const int step = std::max(T, (total_len + MAX_QUADS - 1) / MAX_QUADS);
+    const int half = step / 2;
+
+    std::vector<sst::device::osd::OsdQuadRangle> quads;
+    quads.reserve(MAX_QUADS);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const int ax = points[i][0];
+        const int ay = points[i][1];
+        const int bx = points[(i + 1) % n][0];
+        const int by = points[(i + 1) % n][1];
+        const int dx = bx - ax;
+        const int dy = by - ay;
+        const int len = std::max(std::abs(dx), std::abs(dy));
+        if (len == 0) continue;
+
+        for (int s = 0; s <= len; s += step) {
+            const float t  = static_cast<float>(s) / static_cast<float>(len);
+            const int   px = ax + static_cast<int>(t * dx + 0.5f);
+            const int   py = ay + static_cast<int>(t * dy + 0.5f);
+
+            const int x1 = std::max(0, px - half);
+            const int y1 = std::max(0, py - half);
+            const int x2 = std::min(m_width  - 1, px + half);
+            const int y2 = std::min(m_height - 1, py + half);
+            if (x2 <= x1 || y2 <= y1) continue;
+
+            sst::device::osd::OsdQuadRangle q;
+            q.box      = {static_cast<float>(x1), static_cast<float>(y1),
+                          static_cast<float>(x2), static_cast<float>(y2)};
+            q.color    = coco_config::kColorZoneBox;
+            q.border   = 0;
+            q.alpha    = fdevice::TYPE_ALPHA100;
+            q.type     = fdevice::TYPE_SOLID;
+            q.layer_id = ZONE_LAYER_ID;
+            quads.emplace_back(q);
+        }
+    }
+
+    if (!quads.empty())
+        osd_device.Draw(quads, ZONE_LAYER_ID);
 }
 
 void VISUALIZER::ClearZoneOverlay() {
@@ -431,4 +496,3 @@ void VISUALIZER::DrawBitmap(const std::string& bitmap_path, const std::string& l
 void VISUALIZER::Release() {
     osd_device.Release();  // 释放OSD设备资源
 }
-
