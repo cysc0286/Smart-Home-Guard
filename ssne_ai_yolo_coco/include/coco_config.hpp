@@ -8,10 +8,10 @@ namespace coco_config {
 static const std::array<int, 2> kImageShape  = {1920, 1080};
 static const std::array<int, 2> kCropShape   = {1440, 1080};
 static const int                kCropOffsetX = 240;
-static const std::array<int, 2> kDetShape    = {640, 640};
+static const std::array<int, 2> kDetShape    = {256, 256};
 
 // Model path on the board filesystem
-static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco.m1model";
+static const char* kModelPath = "/app_demo/app_assets/models/yolov8n_coco_256.m1model";
 
 // Snapshot service for the PC-side zone planner.
 static const int   kSnapshotHttpPort      = 8081;
@@ -43,8 +43,8 @@ static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 500;
-static const int   kAlarmHoldMs     = 1500;   // 报警保持：检测丢失后蜂鸣器/LED 仍持续 1.5s
-static const int   kLowLightAlarmHoldMs = 2500;
+static const int   kAlarmHoldMs     = 0;      // 检测丢失立即停止报警
+static const int   kLowLightAlarmHoldMs = 0;
 static const int   kEnvLowLightY     = 40;
 static const int   kEnvBrightY       = 210;
 static const int   kEnvPolicyStableSamples = 3;
