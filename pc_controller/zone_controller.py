@@ -20,7 +20,7 @@ try:
 except ImportError:
     serial = None
 
-WINDOW_NAME = "Smart Home Guard - Snapshot Zone Controller"
+WINDOW_NAME = "HALO - Snapshot Zone Controller"
 DEFAULT_ZONE_FILE = "zone_config.json"
 DEFAULT_CONFIG_FILE = "controller_config.json"
 

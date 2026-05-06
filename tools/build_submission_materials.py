@@ -104,7 +104,7 @@ def build_pptx() -> Path:
 
     slide = prs.slides.add_slide(blank)
     set_bg(slide, dark)
-    text(slide, 0.85, 0.75, 8.2, 0.55, "Smart-Home-Guard", 18, True, RGBColor(139, 210, 255))
+    text(slide, 0.85, 0.75, 8.2, 0.55, "HALO (Home Alert & Location Observer)", 18, True, RGBColor(139, 210, 255))
     text(slide, 0.82, 1.65, 8.6, 1.4, "端侧智能居家安全告警系统", 44, True, RGBColor(255, 255, 255))
     text(slide, 0.86, 3.08, 7.8, 0.55, "Aurora 画面配置 · 端侧检测 · 危险区告警 · 60 秒可验收日志", 18, False, RGBColor(190, 207, 224))
     for x, y, w, h, color in [(9.2, 1.0, 3.1, 2.1, blue), (8.85, 3.55, 2.4, 1.55, yellow), (10.5, 4.65, 1.4, 0.9, red)]:
@@ -250,7 +250,7 @@ def build_pptx() -> Path:
     placeholder(slide, 0.85, 3.75, 11.7, 1.65, "待补：最终材料目录截图 + 演示视频封面帧")
     text(slide, 0.9, 6.35, 11.0, 0.35, "下一步：封版提交前，运行 git status，确认模型文件、材料文件和 zone_config 是否按需入仓。", 12, False, muted)
 
-    path = OUT / "Smart-Home-Guard_intro_draft.pptx"
+    path = OUT / "HALO_intro_draft.pptx"
     prs.save(path)
     return path
 
@@ -303,7 +303,7 @@ def build_docx() -> Path:
 
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run("Smart-Home-Guard\n技术报告")
+    run = p.add_run("HALO (Home Alert & Location Observer)\n技术报告")
     run.bold = True
     run.font.size = DPt(24)
     run.font.name = "Microsoft YaHei"
@@ -312,7 +312,7 @@ def build_docx() -> Path:
     doc.add_paragraph("说明：本文档已包含核心技术路线和材料结构，实物图、Aurora 调试截图、最终 256 模型 60 秒验收日志需由现场测试后补充。").alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_heading("1. 设计目标", 1)
-    doc.add_paragraph("Smart-Home-Guard 面向居家安全场景，在 SmartSens FlyingChip A1 平台完成端侧目标检测、危险区判断、OSD 显示与 GPIO 声光报警。设计重点是现场可运行、结果可验证、参数可配置、异常可恢复。")
+    doc.add_paragraph("HALO (Home Alert & Location Observer) 面向居家安全场景，基于飞凌微 A1 开发套件和思特威图像传感器完成端侧目标检测、危险区判断、OSD 显示与 GPIO 声光报警。设计重点是现场可运行、结果可验证、参数可配置、异常可恢复。")
     table(["目标项", "实现说明", "评分关联"], [
         ["核心功能", "person/dog/cat 进入危险区触发告警", "功能目标完成度"],
         ["可视化", "检测框、危险区、ALERT 位图分图层 OSD 输出", "功能覆盖与可验证性"],
@@ -409,7 +409,7 @@ def build_docx() -> Path:
         ["最终技术数据压缩包目录截图", "证明提交完整性", "待补"],
     ])
 
-    path = OUT / "Smart-Home-Guard_technical_report_draft.docx"
+    path = OUT / "HALO_technical_report_draft.docx"
     doc.save(path)
     return path
 

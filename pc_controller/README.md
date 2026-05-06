@@ -1,6 +1,6 @@
-# PC Zone Controller
+# HALO PC Zone Controller
 
-本目录是 Smart-Home-Guard 的 PC 上位机工具，用于现场配置危险区。推荐使用串口快照模式：板端通过 UART 发送 Aurora 当前画面的低分辨率预览，PC 端在预览图上绘制区域，再把区域 JSON 发回板端。
+本目录是 HALO (Home Alert & Location Observer) 的 PC 上位机工具，用于现场配置危险区。推荐使用串口快照模式：板端通过 UART 发送 Aurora 当前画面的低分辨率预览，PC 端在预览图上绘制区域，再把区域 JSON 发回板端。
 
 ## 快速使用
 

@@ -1,6 +1,6 @@
-# Smart-Home-Guard
+# HALO (Home Alert & Location Observer)
 
-Smart-Home-Guard 是面向居家安全场景的端侧 AI 告警系统。工程运行在 SmartSens FlyingChip A1 平台，完成摄像头取流、人员/宠物检测、危险区域判断、OSD 可视化、GPIO 声光报警、串口配置和 60 秒验收日志输出。
+HALO (Home Alert & Location Observer) 是基于飞凌微 A1 开发套件和思特威图像传感器的端侧 AI 家居告警系统。工程运行在 SmartSens FlyingChip A1 平台，完成摄像头取流、人员/宠物检测、危险区域判断、OSD 可视化、GPIO 声光报警、串口配置和 60 秒验收日志输出。
 
 ## 核心能力
 
