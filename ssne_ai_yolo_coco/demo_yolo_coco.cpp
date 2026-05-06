@@ -44,7 +44,6 @@ struct SnapshotBuffer {
   std::mutex mutex;
 };
 
-// Raw UYVY frame handed from main loop to encode thread
 struct RawFrameBuffer {
   std::vector<unsigned char> uyvy;
   std::array<int, 2> crop_shape = {0, 0};
@@ -392,8 +391,7 @@ bool check_exit_flag() {
   return g_exit_flag;
 }
 
-// Restore crop-offset: coordinates from the 1440x1080 crop must be shifted
-// back to the full 1920x1080 image space before display.
+// 裁剪坐标系(1440x1080) -> 原图坐标系(1920x1080)
 void ConvertCropBoxesToOriginal(CocoDetectionResult* result) {
   for (auto& det : result->detections) {
     det.box_xyxy[0] += static_cast<float>(coco_config::kCropOffsetX);
@@ -704,10 +702,7 @@ void ClassifyDetections(const CocoDetectionResult& result,
   }
 }
 
-// Zone points are stored in 1440x1080 crop coordinates. Judgement uses the
-// true polygon with point-in-polygon. OSD intentionally displays the polygon's
-// bounding rectangle because it is cheaper and more stable for the OSD layer.
-// Shift x before OSD because the OSD layer uses full 1920x1080 coordinates.
+// zone坐标存在裁剪空间(1440x1080)，OSD显示用外接矩形，判断用真实多边形
 void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
   if (visualizer == nullptr) return;
   visualizer->ClearZoneOverlay();
@@ -755,14 +750,14 @@ std::vector<unsigned char> BuildPgmSnapshot(const ssne_tensor_t& img_sensor,
   std::vector<unsigned char> pgm(header.begin(), header.end());
   pgm.reserve(header.size() + width * height);
 
-  // SSNE_YUV422_16 is packed as UYVY on this pipeline; luma is the odd byte.
+  // UYVY格式：亮度Y在奇数字节
   for (int i = 0; i < width * height; ++i) {
     pgm.push_back(src[i * 2 + 1]);
   }
   return pgm;
 }
 
-// Off-main-thread PGM encoder: wakes on new raw UYVY data, encodes, writes to SnapshotBuffer.
+// 后台线程：收到UYVY帧后编码为PGM写入SnapshotBuffer
 void SnapshotEncodeWorker(RawFrameBuffer* raw_buf, SnapshotBuffer* snap_buf) {
   while (!check_exit_flag()) {
     std::vector<unsigned char> uyvy;
@@ -860,7 +855,7 @@ std::vector<unsigned char> BuildPreviewPpm(const ssne_tensor_t& img_sensor,
       const int pair_index = src_y * source_width + pair_x;
       const unsigned char* pair = src + pair_index * 2;
 
-      // UYVY byte order: U0 Y0 V0 Y1. Adjacent pixels share U/V.
+      // UYVY: U0 Y0 V0 Y1,相邻像素共用UV
       const int u_value = pair[0];
       const int y_value = (src_x & 1) ? pair[3] : pair[1];
       const int v_value = pair[2];
@@ -1399,15 +1394,13 @@ int main() {
       det_result.Clear();
     }
 
-    // Keep detections in crop coordinates through tracking and zone judgement.
-    // The PC planner also sends zone coordinates in the 1440x1080 crop space.
+    // 追踪和区域判断都在裁剪坐标系(1440x1080)下完成
     FilterDetectionsByAlarmClasses(&det_result, active_zone);
 
     tracker.Update(det_result);
     CocoDetectionResult stable_crop = tracker.ConfirmedDetections();
 
-    // Zone judgement is done in crop coordinates; display/log coordinates are
-    // shifted back to the full 1920x1080 OSD coordinate space afterwards.
+    // 判断完后坐标转回1920x1080给OSD显示
     std::vector<std::array<float, 4>> normal_boxes;
     std::vector<std::array<float, 4>> alarm_boxes;
     ClassifyDetections(stable_crop, active_zone, &normal_boxes, &alarm_boxes);

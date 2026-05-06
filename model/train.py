@@ -1,9 +1,6 @@
 """
-Fine-tune YOLOv8n on 3-class guard action dataset.
-Classes: 0=bending, 1=standing, 2=squatting
-
-Output: runs/guard_action/weights/best.pt
-Then run export_onnx.py to produce guard_action_head6.onnx
+基于YOLOv8n微调3类动作检测: bending/standing/squatting
+输出: runs/guard_action/weights/best.pt
 """
 
 from pathlib import Path

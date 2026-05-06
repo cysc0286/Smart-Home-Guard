@@ -32,8 +32,7 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
     m_width = width;
     m_height = height;
 
-    // load osd color lut
-    // 如果提供了位图LUT路径，优先使用位图LUT；否则使用默认LUT
+    // 加载颜色查找表
     if (bitmap_lut_path != nullptr && strlen(bitmap_lut_path) > 0) {
         if (LoadLutFile(bitmap_lut_path) != 0) {
             std::cerr << "[OsdDevice] Warning: Failed to load bitmap LUT, using default LUT" << std::endl;
@@ -43,12 +42,11 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         LoadLutFile(m_osd_lut_path.c_str());
     }
 
-    // open osd device
     m_osd_handle = osd_open_device();
-    // init osd (必须在创建图层前调用)
+    // osd_init_device 必须在创建图层前调用
     osd_init_device(m_osd_handle, OSD_LAYER_SIZE, (char*)m_pcolor_lut);
 
-    // Layer 0/1: TYPE_GRAPHIC (检测框 + 危险区域框)
+    // Layer 0/1: 矩形检测框 + 危险区域框
     int dma_size = 0x8000;  // 32KB
     for(int layer_index = 0; layer_index < 2; layer_index++){
         osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, dma_size);sleep(0.25);
@@ -68,9 +66,9 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         osd_set_layer_buffer(m_osd_handle, (ssLAYER_HANDLE)layer_index, m_layer_dma[layer_index]);
     }
 
-    // Layer 2: TYPE_IMAGE / SS_TYPE_RLE (英文ALERT位图)
+    // Layer 2: ALERT报警位图 (RLE编码)
     {
-        const int alarm_dma_size = 0x20000;  // 128KB for RLE bitmap
+        const int alarm_dma_size = 0x20000;  // 128KB
         osd_alloc_buffer(m_osd_handle, m_layer_dma[2].dma, alarm_dma_size);sleep(0.25);
         osd_alloc_buffer(m_osd_handle, m_layer_dma[2].dma_2, alarm_dma_size);
         int dma_fd = osd_get_buffer_fd(m_osd_handle, m_layer_dma[2].dma);
@@ -97,7 +95,6 @@ void OsdDevice::ClearLayer(int layer_id){
 
 void OsdDevice::Release(){
 
-    // destroy layer and delete dma buf
     for(int i = 0; i < OSD_LAYER_SIZE; i++){
         osd_destroy_layer(m_osd_handle, (ssLAYER_HANDLE)i);
 
@@ -118,7 +115,6 @@ void OsdDevice::Release(){
 
 
 int OsdDevice::LoadLutFile(const char* filename){
-    // 检查文件是否存在
     struct stat file_stat;
     if (stat(filename, &file_stat) != 0) {
         std::cerr << "[OsdDevice] ERROR: File does not exist or cannot access: " << filename << std::endl;
@@ -126,20 +122,17 @@ int OsdDevice::LoadLutFile(const char* filename){
         return -1;
     }
 
-    // 检查文件大小
     if (file_stat.st_size <= 0) {
         std::cerr << "[OsdDevice] ERROR: Invalid file size: " << file_stat.st_size << " bytes" << std::endl;
         return -1;
     }
 
-    // 检查文件权限
     if (access(filename, R_OK) != 0) {
         std::cerr << "[OsdDevice] ERROR: No read permission for file: " << filename << std::endl;
         std::cerr << "[OsdDevice] Error code: " << errno << " (" << strerror(errno) << ")" << std::endl;
         return -1;
     }
 
-    // 打开文件
     std::ifstream file(filename, std::ios::binary | std::ios::in | std::ios::ate);
     if (!file) {
         std::cerr << "[OsdDevice] ERROR: Cannot open file: " << filename << std::endl;
@@ -147,7 +140,6 @@ int OsdDevice::LoadLutFile(const char* filename){
         return -1;
     }
 
-    // 获取文件大小
     m_file_size = file.tellg();
     if (m_file_size <= 0) {
         std::cerr << "[OsdDevice] ERROR: Invalid file size from stream: " << m_file_size << " bytes" << std::endl;
@@ -155,12 +147,10 @@ int OsdDevice::LoadLutFile(const char* filename){
         return -1;
     }
 
-    // 分配内存并读取文件
     m_pcolor_lut = new uint8_t[m_file_size];
     file.seekg(0, std::ios::beg);
     file.read((char*)m_pcolor_lut, m_file_size);
 
-    // 检查是否读取成功
     if (file.gcount() != m_file_size) {
         std::cerr << "[OsdDevice] ERROR: Failed to read complete file. Expected: " << m_file_size
                   << " bytes, Read: " << file.gcount() << " bytes" << std::endl;
@@ -174,25 +164,21 @@ int OsdDevice::LoadLutFile(const char* filename){
     return 0;
 }
 
-// draw mode: auto alloc layer
 void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle){
     if ((quad_rangle.size() == 0)){
         osd_clean_all_layer(m_osd_handle);
         return;
     }
 
-    // generate qrangle box
     for(auto &q : quad_rangle){
         GenQrangleBox(q.box, q.border);
         COVER_ATTR_S qrangle_attr = {q.color, q.type, q.alpha, m_qrangle_out, m_qrangle_in};
         osd_add_quad_rangle(m_osd_handle, &qrangle_attr);
     }
 
-    // flush data to ddr
     osd_flush_quad_rangle(m_osd_handle);
 }
 
-// draw mode: manual alloc layer
 void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
     if ((quad_rangle.size() == 0)){
         osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
@@ -201,7 +187,6 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
     }
     int ret = 0;
 
-    // generate qrangle box
     for(auto &q : quad_rangle){
         LOG_DEBUG("Draw --- q.box: %f, %f, %f, %f\n", q.box[0], q.box[1], q.box[2], q.box[3]);
         GenQrangleBox(q.box, q.border);
@@ -210,11 +195,9 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
         LOG_DEBUG("Draw --- osd_add_quad_rangle_layer ret: %d\n", ret);
     }
 
-    // flush data to ddr
     osd_flush_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
 }
 
-// draw mode: manual alloc layer
 void OsdDevice::Draw(std::vector<std::array<float, 4>>& boxes, int border, int layer_id, tagQUADRANGLETYPE type, tagALPHATYPE alpha, int color){
     if ((boxes.size() == 0)){
         osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
@@ -223,55 +206,34 @@ void OsdDevice::Draw(std::vector<std::array<float, 4>>& boxes, int border, int l
 
     osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
     int ret = 0;
-    // generate qrangle box
     for (auto &box : boxes){
         GenQrangleBox(box, border);
         COVER_ATTR_S qrangle_attr = {color, type, alpha, m_qrangle_out, m_qrangle_in};
         ret = osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);
     }
 
-    // flush data to ddr
     osd_flush_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
 }
 
 
-/**
- * @brief 绘制位图到指定图层
- * @note LUT应该在初始化时加载，osd_init_device必须在创建图层前调用
- *       如果在绘制时重新初始化，会破坏已创建的图层
- */
+// LUT在Initialize时已加载，这里只操作位图绘制
 void OsdDevice::DrawTexture(const char* bitmap_path, const char* lut_path, int layer_id, int pos_x, int pos_y, fdevice::ALPHATYPE alpha) {
-    // 注意：LUT已经在Initialize时加载，这里不再重新初始化设备
-    // lut_path参数保留用于日志记录，但不会重新加载LUT
-    // 位图坐标系统：以图层左上角为原点（绝对坐标系统）
-    // pos_x和pos_y是绝对坐标（左上角为原点，Y向下为正）
-
-    // 创建位图信息结构
     fdevice::BITMAP_INFO_S bm_info;
     bm_info.pSSbmpFile = bitmap_path;
     bm_info.alpha = fdevice::TYPE_ALPHA100;
-    bm_info.position.x = pos_x;  // 绝对坐标，以左上角为原点
-    bm_info.position.y = pos_y;  // 绝对坐标，以左上角为原点，Y向下为正
-    //osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id); //zlj+
-    LOG_DEBUG("[OsdDevice] Drawing texture: %s", bitmap_path);
-    LOG_DEBUG(" at absolute position %d,%d", pos_x, pos_y);
-    LOG_DEBUG(" layer_id=%d\n", layer_id);
-    LOG_DEBUG("[OsdDevice] Bitmap file path: %s\n", bitmap_path ? bitmap_path : "NULL");
-    LOG_DEBUG("[OsdDevice] Bitmap position: %d,%d\n", bm_info.position.x, bm_info.position.y);
-    LOG_DEBUG("[OsdDevice] Bitmap alpha: %d\n", (int)bm_info.alpha);
+    bm_info.position.x = pos_x;
+    bm_info.position.y = pos_y;
 
-    // 添加位图到指定图层
-    //std::cout << "[OsdDevice] Calling osd_add_texture_layer for layer_id=" << layer_id << std::endl;
+    LOG_DEBUG("[OsdDevice] Drawing texture: %s", bitmap_path);
+    LOG_DEBUG(" at position %d,%d", pos_x, pos_y);
+    LOG_DEBUG(" layer_id=%d\n", layer_id);
+
     int ret = osd_add_texture_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &bm_info);
     if (ret != 0) {
         std::cerr << "[OsdDevice] ERROR: osd_add_texture_layer failed! ret=" << ret
                   << ", layer_id=" << layer_id << std::endl;
         if (ret == -1) {
             std::cerr << "[OsdDevice] Layer does not exist or type mismatch (should be TYPE_IMAGE)" << std::endl;
-            std::cerr << "[OsdDevice] Possible causes:" << std::endl;
-            std::cerr << "[OsdDevice]   1. Layer " << layer_id << " was not created" << std::endl;
-            std::cerr << "[OsdDevice]   2. Layer " << layer_id << " region type is not TYPE_IMAGE" << std::endl;
-            std::cerr << "[OsdDevice]   3. Layer " << layer_id << " region object (m_pRgn) is nullptr" << std::endl;
         } else if (ret == -2) {
             std::cerr << "[OsdDevice] Bitmap add failed (encoding data too large or invalid file)" << std::endl;
         }
@@ -279,19 +241,10 @@ void OsdDevice::DrawTexture(const char* bitmap_path, const char* lut_path, int l
     }
     LOG_DEBUG("[OsdDevice] osd_add_texture_layer succeeded\n");
 
-    // 刷新位图数据到设备
-    //std::cout << "[OsdDevice] Before flush: checking layer " << layer_id << " status" << std::endl;
-    //std::cout << "[OsdDevice] Calling osd_flush_texture_layer for layer_id=" << layer_id << std::endl;
     ret = osd_flush_texture_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
     if (ret != 0) {
         std::cerr << "[OsdDevice] ERROR: osd_flush_texture_layer failed! ret=" << ret
                   << ", layer_id=" << layer_id << std::endl;
-        std::cerr << "[OsdDevice] Possible causes:" << std::endl;
-        std::cerr << "[OsdDevice]   1. Layer " << layer_id << " codeTYPE is not SS_TYPE_RLE" << std::endl;
-        std::cerr << "[OsdDevice]   2. Layer " << layer_id << " region type mismatch" << std::endl;
-        std::cerr << "[OsdDevice]   3. Layer " << layer_id << " DMA buffer not set correctly" << std::endl;
-        std::cerr << "[OsdDevice]   4. Layer " << layer_id << " region object encoding failed" << std::endl;
-        std::cerr << "[OsdDevice]   5. Layer " << layer_id << " not enabled" << std::endl;
     } else {
         LOG_DEBUG("[OsdDevice] Texture drawn successfully\n");
     }

@@ -1,19 +1,10 @@
 """
-Export the Smart Guard COCO baseline to Head6 ONNX at 256x256 by default.
+将COCO基线权重导出为Head6 ONNX (默认256x256)
+输出6个张量: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls
+  box: [1, h, w, 64] (DFL logits)
+  cls: [1, h, w, 80] (80类logits)
 
-Output: 6 tensors: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls
-  box shape: [1, h, w, 64]   (raw DFL logits)
-  cls shape: [1, h, w, 80]   (raw logits, 80 COCO classes)
-  At 256x256: P3=32x32, P4=16x16, P5=8x8
-
-After export, convert the .onnx to smart_guard_coco_256.m1model.
-Then place it in: ssne_ai_yolo_coco/app_assets/models/smart_guard_coco_256.m1model
-And update coco_config.hpp: kDetShape = {256, 256}
-                             kModelPath = ".../smart_guard_coco_256.m1model"
-
-Usage:
-    python export_coco_256.py
-    python export_coco_256.py --imgsz 416   # for a larger variant
+导出后用工具链转成 .m1model 再部署到板端
 """
 
 import argparse
