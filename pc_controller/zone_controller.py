@@ -101,6 +101,11 @@ class ControllerConfig:
     serial_baudrate: int = 115200
     serial_timeout_sec: float = 10.0
     serial_idle_timeout_sec: float = 0.08
+    serial_tx_chunk_bytes: int = 2
+    serial_tx_chunk_gap_ms: float = 30.0
+    serial_ack_timeout_sec: float = 2.0
+    serial_command_retries: int = 3
+    serial_require_ack: bool = True
     board_ip: str = "192.168.1.88"
     board_port: int = 9000
     zone_file: str = DEFAULT_ZONE_FILE
@@ -147,6 +152,11 @@ def load_controller_config(config_path: Path) -> ControllerConfig:
     config.serial_baudrate = max(int(config.serial_baudrate), 9600)
     config.serial_timeout_sec = max(float(config.serial_timeout_sec), 0.1)
     config.serial_idle_timeout_sec = max(float(config.serial_idle_timeout_sec), 0.05)
+    config.serial_tx_chunk_bytes = max(min(int(config.serial_tx_chunk_bytes), 32), 1)
+    config.serial_tx_chunk_gap_ms = max(float(config.serial_tx_chunk_gap_ms), 0.0)
+    config.serial_ack_timeout_sec = max(float(config.serial_ack_timeout_sec), 0.1)
+    config.serial_command_retries = max(int(config.serial_command_retries), 1)
+    config.serial_require_ack = bool(config.serial_require_ack)
     config.snapshot_refresh_interval_ms = max(int(config.snapshot_refresh_interval_ms), 100)
     config.window_width = max(int(config.window_width), 320)
     config.window_height = max(int(config.window_height), 240)
@@ -192,6 +202,16 @@ def merge_args_into_config(config: ControllerConfig, args: argparse.Namespace) -
         config.serial_timeout_sec = max(args.serial_timeout_sec, 0.1)
     if args.serial_idle_timeout_sec is not None:
         config.serial_idle_timeout_sec = max(args.serial_idle_timeout_sec, 0.05)
+    if args.serial_tx_chunk_bytes is not None:
+        config.serial_tx_chunk_bytes = max(min(args.serial_tx_chunk_bytes, 32), 1)
+    if args.serial_tx_chunk_gap_ms is not None:
+        config.serial_tx_chunk_gap_ms = max(args.serial_tx_chunk_gap_ms, 0.0)
+    if args.serial_ack_timeout_sec is not None:
+        config.serial_ack_timeout_sec = max(args.serial_ack_timeout_sec, 0.1)
+    if args.serial_command_retries is not None:
+        config.serial_command_retries = max(args.serial_command_retries, 1)
+    if args.serial_require_ack is not None:
+        config.serial_require_ack = args.serial_require_ack
     if args.board_ip is not None:
         config.board_ip = args.board_ip
     if args.board_port is not None:
@@ -236,7 +256,7 @@ class ZoneSender(Protocol):
     def display_target(self) -> str:
         ...
 
-    def send(self, zone: Zone) -> None:
+    def send(self, zone: Zone) -> str | None:
         ...
 
 
@@ -246,12 +266,13 @@ class TcpZoneSender:
         self.board_port = board_port
         self.timeout_sec = timeout_sec
 
-    def send(self, zone: Zone) -> None:
+    def send(self, zone: Zone) -> str | None:
         payload = json.dumps(zone.to_dict(), ensure_ascii=False).encode("utf-8") + b"\n"
         with socket.create_connection(
             (self.board_ip, self.board_port), timeout=self.timeout_sec
         ) as conn:
             conn.sendall(payload)
+        return None
 
     def display_target(self) -> str:
         return f"{self.board_ip}:{self.board_port}"
@@ -297,13 +318,29 @@ class FileSnapshotClient:
 
 
 class SerialControlClient:
-    def __init__(self, port: str, baudrate: int, timeout_sec: float, idle_timeout_sec: float) -> None:
+    def __init__(
+        self,
+        port: str,
+        baudrate: int,
+        timeout_sec: float,
+        idle_timeout_sec: float,
+        tx_chunk_bytes: int = 2,
+        tx_chunk_gap_ms: float = 30.0,
+        ack_timeout_sec: float = 2.0,
+        command_retries: int = 3,
+        require_ack: bool = True,
+    ) -> None:
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先执行: pip install pyserial")
         self.port = port
         self.baudrate = baudrate
         self.timeout_sec = timeout_sec
         self.idle_timeout_sec = idle_timeout_sec
+        self.tx_chunk_bytes = max(min(int(tx_chunk_bytes), 32), 1)
+        self.tx_chunk_gap_sec = max(float(tx_chunk_gap_ms), 0.0) / 1000.0
+        self.ack_timeout_sec = max(float(ack_timeout_sec), 0.1)
+        self.command_retries = max(int(command_retries), 1)
+        self.require_ack = bool(require_ack)
 
     def fetch(self) -> SnapshotFrame:
         with self._open_serial() as ser:
@@ -331,16 +368,36 @@ class SerialControlClient:
                 logical_height=logical_height,
             )
 
-    def send(self, zone: Zone) -> None:
+    def send(self, zone: Zone) -> str | None:
         with self._open_serial() as ser:
             ser.reset_input_buffer()
-            payload = json.dumps(zone.to_dict(), ensure_ascii=False)
-            ser.write(f"ZONE {payload}\n".encode("utf-8"))
-            ser.flush()
-            self._try_wait_for_marker(ser, b"OK ZONE", timeout_sec=0.5)
-            ser.write(b"START\n")
-            ser.flush()
-            self._try_wait_for_marker(ser, b"OK START", timeout_sec=0.5)
+            payload = json.dumps(
+                zone.to_dict(), ensure_ascii=True, separators=(",", ":")
+            )
+            commands = (
+                (
+                    f"ZONE {payload}\n".encode("ascii"),
+                    b"OK ZONE",
+                    b"ERR ZONE",
+                    "ZONE",
+                ),
+                (b"START\n", b"OK START", b"ERR CMD", "START"),
+            )
+            if self.require_ack:
+                for command, ok_marker, error_marker, command_name in commands:
+                    self._send_command_with_ack(
+                        ser, command, ok_marker, error_marker, command_name
+                    )
+                return None
+
+            warnings = []
+            for command, ok_marker, error_marker, command_name in commands:
+                warning = self._send_command_best_effort(
+                    ser, command, ok_marker, error_marker, command_name
+                )
+                if warning:
+                    warnings.append(warning)
+            return "; ".join(warnings) or None
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -348,7 +405,71 @@ class SerialControlClient:
     def _open_serial(self):
         return serial.Serial(self.port, self.baudrate, timeout=self.timeout_sec)
 
-    def _wait_for_marker(self, ser, marker: bytes, timeout_sec: float) -> None:
+    def _write_paced(self, ser, payload: bytes) -> None:
+        for offset in range(0, len(payload), self.tx_chunk_bytes):
+            chunk = payload[offset : offset + self.tx_chunk_bytes]
+            ser.write(chunk)
+            ser.flush()
+            if self.tx_chunk_gap_sec > 0 and offset + len(chunk) < len(payload):
+                time.sleep(self.tx_chunk_gap_sec)
+
+    def _send_command_with_ack(
+        self,
+        ser,
+        command: bytes,
+        ok_marker: bytes,
+        error_marker: bytes,
+        command_name: str,
+    ) -> None:
+        last_error: RuntimeError | None = None
+        for attempt in range(1, self.command_retries + 1):
+            ser.reset_input_buffer()
+            self._write_paced(ser, command)
+            try:
+                self._wait_for_marker(
+                    ser,
+                    marker=ok_marker,
+                    error_marker=error_marker,
+                    timeout_sec=self.ack_timeout_sec,
+                )
+                return
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt < self.command_retries:
+                    time.sleep(0.1)
+
+        raise RuntimeError(
+            f"{command_name} failed after {self.command_retries} attempts: {last_error}"
+        )
+
+    def _send_command_best_effort(
+        self,
+        ser,
+        command: bytes,
+        ok_marker: bytes,
+        error_marker: bytes,
+        command_name: str,
+    ) -> str | None:
+        ser.reset_input_buffer()
+        self._write_paced(ser, command)
+        try:
+            self._wait_for_marker(
+                ser,
+                marker=ok_marker,
+                error_marker=error_marker,
+                timeout_sec=self.ack_timeout_sec,
+            )
+            return None
+        except RuntimeError as exc:
+            return f"{command_name} ACK unreadable ({exc})"
+
+    def _wait_for_marker(
+        self,
+        ser,
+        marker: bytes,
+        error_marker: bytes,
+        timeout_sec: float,
+    ) -> None:
         buffer = bytearray()
         deadline = time.monotonic() + timeout_sec
         max_scan_bytes = 8192
@@ -362,18 +483,19 @@ class SerialControlClient:
                 buffer.extend(chunk)
                 if marker in buffer:
                     return
+                if error_marker in buffer:
+                    received = bytes(buffer[:64]).hex(" ") or "<empty>"
+                    raise RuntimeError(
+                        f"board returned {error_marker.decode('ascii')}; rx={received}"
+                    )
                 if len(buffer) > max_scan_bytes:
                     del buffer[:-len(marker)]
         finally:
             ser.timeout = original_timeout
-        raise RuntimeError(f"串口等待板端响应超时: {marker.decode('ascii', errors='ignore')}")
-
-    def _try_wait_for_marker(self, ser, marker: bytes, timeout_sec: float) -> bool:
-        try:
-            self._wait_for_marker(ser, marker, timeout_sec)
-            return True
-        except RuntimeError:
-            return False
+        received = bytes(buffer[:64]).hex(" ") or "<empty>"
+        raise RuntimeError(
+            f"timeout waiting for {marker.decode('ascii', errors='ignore')}; rx={received}"
+        )
 
     def _read_snapshot_header(self, ser) -> str:
         marker = b"SNAPSHOT "
@@ -534,6 +656,7 @@ class ZoneDrawerApp:
         self.draft_points: list[tuple[int, int]] = []
         self.hover_point: tuple[int, int] | None = None
         self.current_zone: Zone | None = self._load_zone()
+        self.pending_zone: Zone | None = None
         self.last_status = "Starting: fetching board snapshot..."
         self.exit_requested = False
 
@@ -653,19 +776,26 @@ class ZoneDrawerApp:
         display = frame.copy()
 
         if self.current_zone is not None:
-            self._draw_zone(display, self.current_zone, (0, 0, 255), filled=True)
+            self._draw_zone(
+                display, self.current_zone, (0, 220, 255), filled=True, label="Active"
+            )
+
+        if self.pending_zone is not None:
+            self._draw_zone(
+                display, self.pending_zone, (255, 0, 255), filled=False, label="Pending"
+            )
 
         if self.draft_points:
             draft_display = [self._point_to_display(point) for point in self.draft_points]
             if self.hover_point is not None:
                 draft_display.append(self._point_to_display(self.hover_point))
             for start, end in zip(draft_display, draft_display[1:]):
-                cv2.line(display, start, end, (0, 220, 255), 2)
+                cv2.line(display, start, end, (255, 255, 0), 2)
             for index, point in enumerate(draft_display[: len(self.draft_points)]):
                 radius = 7 if index == 0 else 5
-                cv2.circle(display, point, radius, (0, 220, 255), -1)
+                cv2.circle(display, point, radius, (255, 255, 0), -1)
             first = draft_display[0]
-            cv2.circle(display, first, 12, (0, 220, 255), 2)
+            cv2.circle(display, first, 12, (255, 255, 0), 2)
 
         cv2.rectangle(display, (0, 0), (display.shape[1], 48), (0, 0, 0), -1)
         cv2.putText(
@@ -679,7 +809,7 @@ class ZoneDrawerApp:
         )
         cv2.putText(
             display,
-            "Click: add point | click first point: close | Z: undo | N: snapshot | S: send | C: clear | Q: quit",
+            "Click: redraw | click first: close | Z: undo | C: cancel draft | N: snapshot | S: apply | Q: quit",
             (10, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -695,6 +825,7 @@ class ZoneDrawerApp:
         zone: Zone,
         color: tuple[int, int, int],
         filled: bool,
+        label: str = "Zone",
     ) -> None:
         display_points = np.array(
             [self._point_to_display(point) for point in zone.normalized().points],
@@ -720,7 +851,7 @@ class ZoneDrawerApp:
             return
         cv2.putText(
             display,
-            f"Zone: {zone.describe()}",
+            f"{label}: {zone.describe()}",
             (label_anchor[0], max(label_anchor[1] - 8, 18)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -760,24 +891,18 @@ class ZoneDrawerApp:
 
         if event == cv2.EVENT_LBUTTONDOWN:
             if self._is_near_first_point(x, y):
-                self.current_zone = Zone(
-                    shape="polygon",
-                    points=list(self.draft_points),
-                    alarm_classes=list(self.alarm_classes),
-                )
-                self.draft_points.clear()
-                self.hover_point = None
-                self._save_zone(self.current_zone)
-                self.last_status = f"Zone set: {self.current_zone.describe()}"
-                if self.auto_send:
+                if self._finish_polygon_if_ready() and self.auto_send:
                     self._send_zone()
                 return
 
             point = self._display_to_logical(x, y)
+            if not self.draft_points:
+                self.pending_zone = None
             self.draft_points.append(point)
-            self.current_zone = None
-            self._save_zone(None)
-            self.last_status = f"Point {len(self.draft_points)} set: ({point[0]},{point[1]})"
+            self.last_status = (
+                f"Draft point {len(self.draft_points)}: ({point[0]},{point[1]}); "
+                "active zone remains on board"
+            )
         elif event == cv2.EVENT_MOUSEMOVE:
             self.hover_point = self._display_to_logical(x, y) if self.draft_points else None
 
@@ -787,40 +912,52 @@ class ZoneDrawerApp:
             self.hover_point = None
             self.last_status = f"Removed point: ({removed[0]},{removed[1]})"
             return
+        if self.pending_zone is not None:
+            self.pending_zone = None
+            self.last_status = "Pending zone cancelled; active zone unchanged"
+            return
         self.last_status = "No draft point to remove"
 
     def _finish_polygon_if_ready(self) -> bool:
         if len(self.draft_points) < 3:
             self.last_status = "Need at least 3 points before closing the polygon"
             return False
-        self.current_zone = Zone(
+        self.pending_zone = Zone(
             shape="polygon",
             points=list(self.draft_points),
             alarm_classes=list(self.alarm_classes),
         )
         self.draft_points.clear()
         self.hover_point = None
-        self._save_zone(self.current_zone)
-        self.last_status = f"Zone set: {self.current_zone.describe()}"
+        self.last_status = f"Pending zone ready: {self.pending_zone.describe()}; press S to apply"
         return True
 
     def _send_zone(self) -> None:
-        if self.current_zone is None and self.draft_points:
+        if self.draft_points:
             if not self._finish_polygon_if_ready():
                 return
-        if self.current_zone is None:
+        zone_to_send = self.pending_zone or self.current_zone
+        if zone_to_send is None:
             self.last_status = "No zone selected"
             return
         try:
-            self.sender.send(self.current_zone)
-        except OSError as exc:
+            warning = self.sender.send(zone_to_send)
+        except (OSError, RuntimeError) as exc:
             self.last_status = f"Send failed: {exc}"
             return
 
+        if self.pending_zone is not None:
+            self.current_zone = self.pending_zone
+            self.pending_zone = None
+            self._save_zone(self.current_zone)
+
         self.last_status = (
             f"Sent to board {self.sender.display_target()} -> "
-            f"{self.current_zone.describe()}"
+            f"{zone_to_send.describe()}"
         )
+        if warning:
+            self.last_status += f"; warning: {warning}"
+            print(f"[WARN] {warning}", file=sys.stderr)
         if self.auto_exit_after_send:
             self.exit_requested = True
             return
@@ -828,11 +965,14 @@ class ZoneDrawerApp:
             self._fetch_snapshot()
 
     def _clear_zone(self) -> None:
-        self.current_zone = None
+        had_draft = bool(self.draft_points) or self.pending_zone is not None
         self.draft_points.clear()
         self.hover_point = None
-        self._save_zone(None)
-        self.last_status = "Zone cleared"
+        self.pending_zone = None
+        if had_draft:
+            self.last_status = "Draft cancelled; active zone unchanged"
+        else:
+            self.last_status = "No draft to cancel; active zone unchanged"
 
     def _snapshot_worker(self) -> None:
         interval_sec = max(self.snapshot_refresh_interval_ms / 1000.0, 0.1)
@@ -953,6 +1093,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="串口图片数据空闲补尾等待时间（秒）",
+    )
+    parser.add_argument(
+        "--serial-tx-chunk-bytes",
+        type=int,
+        default=None,
+        help="ZONE/START 每个串口发送分块的字节数（1-32）",
+    )
+    parser.add_argument(
+        "--serial-tx-chunk-gap-ms",
+        type=float,
+        default=None,
+        help="串口发送分块间隔（毫秒）",
+    )
+    parser.add_argument(
+        "--serial-ack-timeout-sec",
+        type=float,
+        default=None,
+        help="等待板端 OK ZONE/OK START 的超时时间（秒）",
+    )
+    parser.add_argument(
+        "--serial-command-retries",
+        type=int,
+        default=None,
+        help="ZONE/START 未收到有效 ACK 时的重试次数",
+    )
+    parser.add_argument(
+        "--serial-require-ack",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否必须收到有效 ACK 才继续；回传异常时可使用 --no-serial-require-ack",
     )
     parser.add_argument(
         "--board-ip",
@@ -1080,6 +1250,11 @@ def main() -> int:
                 baudrate=config.serial_baudrate,
                 timeout_sec=config.serial_timeout_sec,
                 idle_timeout_sec=config.serial_idle_timeout_sec,
+                tx_chunk_bytes=config.serial_tx_chunk_bytes,
+                tx_chunk_gap_ms=config.serial_tx_chunk_gap_ms,
+                ack_timeout_sec=config.serial_ack_timeout_sec,
+                command_retries=config.serial_command_retries,
+                require_ack=config.serial_require_ack,
             )
             snapshot_client = serial_client
             sender = serial_client
