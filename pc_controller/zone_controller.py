@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,7 @@ try:
 except ImportError:
     serial = None
 
-WINDOW_NAME = "Smart Home Guard - Snapshot Zone Controller"
+WINDOW_NAME = "HALO - Snapshot Zone Controller"
 DEFAULT_ZONE_FILE = "zone_config.json"
 DEFAULT_CONFIG_FILE = "controller_config.json"
 
@@ -658,6 +660,10 @@ class ZoneDrawerApp:
         self.last_status = "Starting: fetching board snapshot..."
         self.exit_requested = False
 
+        self._snapshot_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._bg_stop = threading.Event()
+        self._bg_thread: threading.Thread | None = None
+
     def _load_zone(self) -> Zone | None:
         if not self.zone_file.exists():
             return None
@@ -752,7 +758,6 @@ class ZoneDrawerApp:
             self.window_width / max(source_w, 1),
             self.window_height / max(source_h, 1),
         )
-        scale = max(scale, 1.0)
         target_w = max(1, int(round(source_w * scale)))
         target_h = max(1, int(round(source_h * scale)))
         if target_w != source_w or target_h != source_h:
@@ -969,14 +974,37 @@ class ZoneDrawerApp:
         else:
             self.last_status = "No draft to cancel; active zone unchanged"
 
-    def _maybe_auto_refresh_snapshot(self) -> None:
-        if not self.auto_refresh_snapshot or self.draft_points:
+    def _snapshot_worker(self) -> None:
+        interval_sec = max(self.snapshot_refresh_interval_ms / 1000.0, 0.1)
+        while not self._bg_stop.wait(interval_sec):
+            if not self.auto_refresh_snapshot or self.draft_points:
+                continue
+            try:
+                frame = self.snapshot_client.fetch()
+                result: tuple = ("ok", frame)
+            except Exception as exc:
+                result = ("err", str(exc))
+            try:
+                self._snapshot_queue.put_nowait(result)
+            except queue.Full:
+                pass
+
+    def _process_snapshot_queue(self) -> None:
+        try:
+            tag, payload = self._snapshot_queue.get_nowait()
+        except queue.Empty:
             return
-        now = time.monotonic()
-        elapsed_ms = (now - self.last_snapshot_fetch_monotonic) * 1000.0
-        if elapsed_ms < self.snapshot_refresh_interval_ms:
-            return
-        self._fetch_snapshot()
+        if tag == "ok":
+            self.current_image = self._prepare_display_image(payload.image)
+            self.logical_width = payload.logical_width
+            self.logical_height = payload.logical_height
+            h, w = self.current_image.shape[:2]
+            self.last_snapshot_fetch_monotonic = time.monotonic()
+            self.last_status = (
+                f"Snapshot OK: preview {w}x{h} | logical {self.logical_width}x{self.logical_height}"
+            )
+        else:
+            self.last_status = f"Snapshot failed: {payload}"
 
     def run(self) -> int:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -985,30 +1013,37 @@ class ZoneDrawerApp:
 
         self._fetch_snapshot_with_retry()
 
-        while True:
-            frame = self.current_image if self.current_image is not None else self._make_blank()
-            display = self._draw_overlay(frame)
-            cv2.imshow(WINDOW_NAME, display)
-            if self.exit_requested:
-                cv2.destroyAllWindows()
-                return 0
+        self._bg_stop.clear()
+        self._bg_thread = threading.Thread(target=self._snapshot_worker, daemon=True)
+        self._bg_thread.start()
 
-            key = cv2.waitKey(30) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
-                cv2.destroyAllWindows()
-                return 0
-            if key in (ord("n"), ord("N")):
-                self._fetch_snapshot()
-            elif key in (ord("s"), ord("S")):
-                self._send_zone()
+        try:
+            while True:
+                self._process_snapshot_queue()
+                frame = self.current_image if self.current_image is not None else self._make_blank()
+                display = self._draw_overlay(frame)
+                cv2.imshow(WINDOW_NAME, display)
                 if self.exit_requested:
                     cv2.destroyAllWindows()
                     return 0
-            elif key in (ord("c"), ord("C")):
-                self._clear_zone()
-            elif key in (ord("z"), ord("Z"), 8):
-                self._undo_point()
-            self._maybe_auto_refresh_snapshot()
+
+                key = cv2.waitKey(30) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):
+                    cv2.destroyAllWindows()
+                    return 0
+                if key in (ord("n"), ord("N")):
+                    self._fetch_snapshot()
+                elif key in (ord("s"), ord("S")):
+                    self._send_zone()
+                    if self.exit_requested:
+                        cv2.destroyAllWindows()
+                        return 0
+                elif key in (ord("c"), ord("C")):
+                    self._clear_zone()
+                elif key in (ord("z"), ord("Z"), 8):
+                    self._undo_point()
+        finally:
+            self._bg_stop.set()
 
 
 def build_parser() -> argparse.ArgumentParser:

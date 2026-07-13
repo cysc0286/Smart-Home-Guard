@@ -10,12 +10,7 @@
 #include "coco_config.hpp"
 #include "coco_types.hpp"
 
-// Temporal debounce tracker for object detections.
-//
-// A detection must remain matched for coco_config::kAlarmConfirmMs before being
-// shown. Once confirmed, it stays visible until absent for
-// coco_config::kAlarmClearMs. Box coordinates are smoothed with exponential
-// moving average to reduce jitter.
+// 检测去抖：连续匹配 kAlarmConfirmMs 后才确认，消失 kAlarmClearMs 后移除，坐标做EMA平滑
 class DebounceTracker {
  public:
   struct Track {
@@ -101,7 +96,6 @@ class DebounceTracker {
     }
   }
 
-  // Returns only confirmed (stable) tracks as boxes for OSD display
   std::vector<std::array<float, 4>> ConfirmedBoxes() const {
     std::vector<std::array<float, 4>> boxes;
     for (const auto& t : tracks_) {
@@ -110,7 +104,6 @@ class DebounceTracker {
     return boxes;
   }
 
-  // Returns confirmed tracks as a CocoDetectionResult for logging
   CocoDetectionResult ConfirmedDetections() const {
     CocoDetectionResult result;
     for (const auto& t : tracks_) {
@@ -126,10 +119,8 @@ class DebounceTracker {
   }
 
  private:
-  // Minimum IoU to match a detection to an existing track
   static constexpr float kIoUThreshold = 0.3f;
-  // Exponential smoothing factor (0=no update, 1=no smoothing)
-  static constexpr float kSmoothing    = 0.4f;
+  static constexpr float kSmoothing    = 0.4f;   // EMA平滑系数
 
   std::vector<Track> tracks_;
 

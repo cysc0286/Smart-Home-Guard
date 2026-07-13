@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -41,6 +42,14 @@ struct SnapshotBuffer {
   int height = 0;
   bool ready = false;
   std::mutex mutex;
+};
+
+struct RawFrameBuffer {
+  std::vector<unsigned char> uyvy;
+  std::array<int, 2> crop_shape = {0, 0};
+  bool pending = false;
+  std::mutex mutex;
+  std::condition_variable cv;
 };
 
 enum class EnvPolicy {
@@ -382,8 +391,7 @@ bool check_exit_flag() {
   return g_exit_flag;
 }
 
-// Restore crop-offset: coordinates from the 1440x1080 crop must be shifted
-// back to the full 1920x1080 image space before display.
+// 裁剪坐标系(1440x1080) -> 原图坐标系(1920x1080)
 void ConvertCropBoxesToOriginal(CocoDetectionResult* result) {
   for (auto& det : result->detections) {
     det.box_xyxy[0] += static_cast<float>(coco_config::kCropOffsetX);
@@ -694,8 +702,7 @@ void ClassifyDetections(const CocoDetectionResult& result,
   }
 }
 
-// Zone points are stored in 1440x1080 crop coordinates. Shift x before OSD,
-// because the OSD layer uses the full 1920x1080 image coordinates.
+// zone坐标存在裁剪空间(1440x1080)，OSD显示用外接矩形，判断用真实多边形
 void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
   if (visualizer == nullptr) return;
   visualizer->ClearZoneOverlay();
@@ -706,8 +713,10 @@ void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
     for (const auto& p : zone.points) {
       pts.push_back({p.x + coco_config::kCropOffsetX, p.y});
     }
+    printf("[ZONE] judgement=polygon display=bbox points=%zu\n", zone.points.size());
     visualizer->DrawZonePolygonBBox(pts);
   } else {
+    printf("[ZONE] judgement=rect display=rect\n");
     visualizer->DrawZoneRect(zone.X1() + coco_config::kCropOffsetX,
                              zone.Y1(),
                              zone.X2() + coco_config::kCropOffsetX,
@@ -741,11 +750,44 @@ std::vector<unsigned char> BuildPgmSnapshot(const ssne_tensor_t& img_sensor,
   std::vector<unsigned char> pgm(header.begin(), header.end());
   pgm.reserve(header.size() + width * height);
 
-  // SSNE_YUV422_16 is packed as UYVY on this pipeline; luma is the odd byte.
+  // UYVY格式：亮度Y在奇数字节
   for (int i = 0; i < width * height; ++i) {
     pgm.push_back(src[i * 2 + 1]);
   }
   return pgm;
+}
+
+// 后台线程：收到UYVY帧后编码为PGM写入SnapshotBuffer
+void SnapshotEncodeWorker(RawFrameBuffer* raw_buf, SnapshotBuffer* snap_buf) {
+  while (!check_exit_flag()) {
+    std::vector<unsigned char> uyvy;
+    std::array<int, 2> cs;
+    {
+      std::unique_lock<std::mutex> lock(raw_buf->mutex);
+      raw_buf->cv.wait_for(lock, std::chrono::seconds(1),
+          [raw_buf] { return raw_buf->pending || check_exit_flag(); });
+      if (!raw_buf->pending) continue;
+      uyvy = std::move(raw_buf->uyvy);
+      cs = raw_buf->crop_shape;
+      raw_buf->pending = false;
+    }
+    const int w = cs[0];
+    const int h = cs[1];
+    if (w <= 0 || h <= 0 || uyvy.size() < static_cast<size_t>(w * h * 2)) continue;
+    std::string header = "P5\n" + std::to_string(w) + " " + std::to_string(h) + "\n255\n";
+    std::vector<unsigned char> pgm(header.begin(), header.end());
+    pgm.reserve(header.size() + w * h);
+    for (int i = 0; i < w * h; ++i) {
+      pgm.push_back(uyvy[i * 2 + 1]);
+    }
+    {
+      std::lock_guard<std::mutex> lock(snap_buf->mutex);
+      snap_buf->pgm_bytes = std::move(pgm);
+      snap_buf->width  = w;
+      snap_buf->height = h;
+      snap_buf->ready  = true;
+    }
+  }
 }
 
 std::vector<unsigned char> BuildPreviewPgm(const ssne_tensor_t& img_sensor,
@@ -813,7 +855,7 @@ std::vector<unsigned char> BuildPreviewPpm(const ssne_tensor_t& img_sensor,
       const int pair_index = src_y * source_width + pair_x;
       const unsigned char* pair = src + pair_index * 2;
 
-      // UYVY byte order: U0 Y0 V0 Y1. Adjacent pixels share U/V.
+      // UYVY: U0 Y0 V0 Y1,相邻像素共用UV
       const int u_value = pair[0];
       const int y_value = (src_x & 1) ? pair[3] : pair[1];
       const int v_value = pair[2];
@@ -1149,6 +1191,7 @@ int main() {
   CocoDetectionResult det_result;
   DebounceTracker     tracker;
   SnapshotBuffer      snapshot_buffer;
+  RawFrameBuffer      raw_frame_buf;
   GuardZone           active_zone;
   UartControlChannel  uart_channel;
 
@@ -1190,6 +1233,7 @@ int main() {
   std::thread listener_thread(keyboard_listener);
   SnapshotHttpServer snapshot_server(coco_config::kSnapshotHttpPort, &snapshot_buffer);
   std::thread snapshot_thread(&SnapshotHttpServer::Run, &snapshot_server);
+  std::thread snapshot_encode_thread(SnapshotEncodeWorker, &raw_frame_buf, &snapshot_buffer);
 
   auto last_log_time      = std::chrono::steady_clock::now();
   auto last_snapshot_time = std::chrono::steady_clock::now() -
@@ -1319,18 +1363,16 @@ int main() {
     const auto snapshot_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_snapshot_time).count();
     if (snapshot_elapsed_ms >= coco_config::kRunSnapshotUpdateIntervalMs) {
-      std::vector<unsigned char> pgm = BuildPgmSnapshot(img_sensor, crop_shape);
-      {
-        std::lock_guard<std::mutex> lock(snapshot_buffer.mutex);
-        snapshot_buffer.pgm_bytes = pgm;
-        snapshot_buffer.width  = crop_shape[0];
-        snapshot_buffer.height = crop_shape[1];
-        snapshot_buffer.ready  = true;
-      }
-      if (coco_config::kSaveSnapshotFileInRun &&
-          !SaveSnapshotToFile(pgm, coco_config::kSnapshotFilePath)) {
-        ++accept_stats.resource_warnings;
-        printf("[SNAPSHOT] failed to save %s\n", coco_config::kSnapshotFilePath);
+      void* data_ptr = get_data(img_sensor);
+      if (data_ptr) {
+        const size_t sz = static_cast<size_t>(crop_shape[0]) * crop_shape[1] * 2;
+        std::lock_guard<std::mutex> lock(raw_frame_buf.mutex);
+        raw_frame_buf.uyvy.assign(
+            static_cast<const unsigned char*>(data_ptr),
+            static_cast<const unsigned char*>(data_ptr) + sz);
+        raw_frame_buf.crop_shape = crop_shape;
+        raw_frame_buf.pending    = true;
+        raw_frame_buf.cv.notify_one();
       }
       last_snapshot_time = now;
     }
@@ -1352,15 +1394,13 @@ int main() {
       det_result.Clear();
     }
 
-    // Keep detections in crop coordinates through tracking and zone judgement.
-    // The PC planner also sends zone coordinates in the 1440x1080 crop space.
+    // 追踪和区域判断都在裁剪坐标系(1440x1080)下完成
     FilterDetectionsByAlarmClasses(&det_result, active_zone);
 
     tracker.Update(det_result);
     CocoDetectionResult stable_crop = tracker.ConfirmedDetections();
 
-    // Zone judgement is done in crop coordinates; display/log coordinates are
-    // shifted back to the full 1920x1080 OSD coordinate space afterwards.
+    // 判断完后坐标转回1920x1080给OSD显示
     std::vector<std::array<float, 4>> normal_boxes;
     std::vector<std::array<float, 4>> alarm_boxes;
     ClassifyDetections(stable_crop, active_zone, &normal_boxes, &alarm_boxes);
@@ -1487,6 +1527,10 @@ int main() {
 
   if (listener_thread.joinable()) {
     listener_thread.join();
+  }
+  raw_frame_buf.cv.notify_all();
+  if (snapshot_encode_thread.joinable()) {
+    snapshot_encode_thread.join();
   }
   if (snapshot_thread.joinable()) {
     snapshot_thread.join();

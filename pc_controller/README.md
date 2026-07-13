@@ -1,20 +1,12 @@
-# PC 端禁区画框控制器（单帧快照模式）
+# HALO PC Zone Controller
 
-本目录是 **PC 上位机** 工具，和 `model/`、`ssne_ai_yolo_coco/` 并列。
+本目录是 HALO (Home Alert & Location Observer) 的 PC 上位机工具，用于现场配置危险区。推荐使用串口快照模式：板端通过 UART 发送 Aurora 当前画面的低分辨率预览，PC 端在预览图上绘制区域，再把区域 JSON 发回板端。
 
-本程序不依赖实时视频流，而是：
+## 快速使用
 
-1. 启动后自动向板端请求一张当前快照（HTTP）
-2. 在可视化窗口里直接画禁区
-3. 通过 TCP 将禁区发送到板端
+第一次使用：
 
-这套方式对低性能板子更友好。
-
-## 一键启动（推荐）
-
-### 第一次使用
-
-```bash
+```bat
 cd pc_controller
 pip install -r requirements.txt
 ```
@@ -88,65 +80,56 @@ pip install -r requirements.txt
 - `--tcp-timeout-sec`：TCP 发送超时时间
 - `--window-width` / `--window-height`：窗口初始大小
 
-## 板端必须配合的接口
-
-### 1) HTTP 快照接口（必须）
-
-如果板子可联网，推荐使用 **板端主程序内置的快照服务**。启动 `ssne_ai_yolo_coco` 后，板端会监听：
-
-```text
-GET /?action=snapshot
-```
-
-示例：
-
-```text
-http://<board_ip>:8081/?action=snapshot
-```
-
-返回一张当前帧图片。
-
-当前内置服务实际返回的是 **PGM 灰度图**，但浏览器和本程序都可以正常打开。
-
-如果板子**不能联网**，`ssne_ai_yolo_coco` 还会持续写出：
-
-```text
-/app_demo/latest_snapshot.pgm
-```
-
-此时上位机把 `snapshot_source` 设为 `file`，并让 `snapshot_file` 指向你拷到电脑上的 `latest_snapshot.pgm` 即可。
-
-### 2) 串口启动配置（离线推荐）
-
-如果板子不能联网，但串口可用，启动 `ssne_ai_yolo_coco` 后会先等待串口命令：
-
-- `SNAPSHOT`：返回一张低分辨率灰度预览图
-- `ZONE <json>`：写入禁区配置
-- `START`：结束配置并开始正式检测
-
-上位机 `serial` 模式会自动完成这三步。你只需要：
-
-1. 板子上运行 `./ssne_ai_yolo_coco`
-2. 电脑上把 `controller_config.json` 里的 `serial_port` 改成实际串口
-3. 双击 `run.bat`
-4. 画框后按 `S`
-
-> 如果你还在使用旧版 `mjpg_streamer` 方案，通常也是 `?action=snapshot`，不是 `/snapshot.jpg`。
-
-### 2) TCP 禁区接收接口（必须）
-
-板端监听端口（默认 9000），接收上位机发送的单行 JSON：
-
 ```json
-{"type":"zone_update","shape":"rect","x1":500,"y1":300,"x2":900,"y2":700}
+{
+  "snapshot_source": "serial",
+  "serial_port": "COM6",
+  "serial_baudrate": 115200,
+  "alarm_classes": ["person", "dog", "cat"]
+}
 ```
 
-## 板端自动化
+运行：
 
-当前推荐让 `ssne_ai_yolo_coco` 作为板端常驻程序启动。只要该程序在运行，快照接口就会同时可用：
+```bat
+run.bat
+```
+
+## 操作键
+
+| 操作 | 说明 |
+| --- | --- |
+| 鼠标左键 | 逐点绘制多边形危险区 |
+| `Z` / Backspace | 撤销最后一个点 |
+| `C` | 清除危险区 |
+| `N` | 重新请求一张快照 |
+| `S` | 发送危险区到板端 |
+| `Q` / Esc | 退出 |
+
+## 工作模式
+
+`snapshot_source` 支持三种：
+
+- `serial`：推荐；无网络时可用，配合 `SNAPSHOT`、`ZONE`、`START` 串口命令。
+- `http`：板端 HTTP 快照服务可用时使用。
+- `file`：离线读取本地 `latest_snapshot.pgm`。
+
+当前版本的自动刷新已移入后台线程，避免快照请求阻塞窗口交互。绘制过程中会暂停自动刷新，防止区域点位漂移。
+
+## 坐标与显示约定
+
+- 上位机发送的点位使用 1440x1080 crop 坐标。
+- 板端危险区判断对多边形使用真实 point-in-polygon。
+- 板端 OSD 对多边形危险区显示外接矩形，这是出于 OSD buffer 和现场稳定性的取舍；该显示方式不影响真实多边形告警判断。
+
+## 串口配置阶段
+
+板端启动后会等待配置命令：
 
 ```text
-http://<board_ip>:8081/?action=snapshot
+SNAPSHOT
+ZONE <json>
+START
 ```
 
 旧版 `board_autostart_mjpg.sh` 仅适用于 `mjpg_streamer + /dev/video0` 路线，不适用于当前这块基于 SmartSens SDK 取图的板子。

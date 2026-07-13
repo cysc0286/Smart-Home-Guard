@@ -16,7 +16,7 @@ bool COCO_DETECTOR::Initialize(std::string& model_path,
   model_id = ssne_loadmodel(model_path_char, SSNE_STATIC_ALLOC);
   printf("[RESOURCE] ssne_loadmodel returned model_id=%d\n", (int)model_id);
 
-  // ssne_loadmodel returns 0 for the first model (valid). Use dtype query to verify.
+  // ssne_loadmodel 返回0也合法（第一个模型），用dtype查询判断是否成功
   int input_dtype = SSNE_FLOAT32;
   const int dtype_ret = ssne_get_model_input_dtype(model_id, &input_dtype);
   if (dtype_ret != 0) {
@@ -101,7 +101,7 @@ void COCO_DETECTOR::BuildDetectionsForScale(const float* box_ptr,
         continue;
       }
 
-      // Only keep person(0), cat(15), dog(16)
+      // 只保留 person(0), cat(15), dog(16)
       if (best_cls != 0 && best_cls != 15 && best_cls != 16) {
         continue;
       }

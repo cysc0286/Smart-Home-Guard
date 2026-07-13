@@ -1,23 +1,32 @@
-# Model Placeholder
+# Board Model Assets
 
-Place the converted model file here:
+板端正式运行需要在本目录放置：
 
-    yolov8n_coco.m1model
+```text
+smart_guard_coco_256.m1model
+```
 
-## How to obtain the model
+该文件对应 `ssne_ai_yolo_coco/include/coco_config.hpp`：
 
-1. Run the export script on your PC (inside `d:\yolo_learn\define pro\`):
+```cpp
+static const std::array<int, 2> kDetShape = {256, 256};
+static const char* kModelPath = "/app_demo/app_assets/models/smart_guard_coco_256.m1model";
+```
 
-   ```
-   cd "d:\yolo_learn\define pro"
-   python export_onnx.py
-   ```
+## 获取方式
 
-   This produces `yolov8n_coco_head6.onnx`.
+1. 在 PC 端执行：
 
-2. Upload `yolov8n_coco_head6.onnx` to the 思思AI assistant and request
-   conversion to m1model format (same settings used for guard_v1_head6).
+```bat
+cd model
+python export_coco_256.py
+```
 
-3. Rename the downloaded output to `yolov8n_coco.m1model` and place it here.
+2. 将生成的 `smart_guard_coco_head6_256.onnx` 转换为 M1 模型。
+3. 将转换结果命名为 `smart_guard_coco_256.m1model`。
+4. 拷贝到本目录，并随提交材料压缩包一起提交。
 
-4. Rebuild and reflash.
+## 注意
+
+- Git 默认忽略 `*.m1model`，因此制作技术数据压缩包时必须手动确认模型文件已包含。
+- `smart_guard_coco_640_legacy.m1model` 仅作为历史兼容资源保留，正式配置不再使用。

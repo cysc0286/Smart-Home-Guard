@@ -1,19 +1,10 @@
 """
-Export yolov8n COCO to Head6 ONNX at 256x256 input size by default.
+将COCO基线权重导出为Head6 ONNX (默认256x256)
+输出6个张量: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls
+  box: [1, h, w, 64] (DFL logits)
+  cls: [1, h, w, 80] (80类logits)
 
-Output: 6 tensors: P3_box, P3_cls, P4_box, P4_cls, P5_box, P5_cls
-  box shape: [1, h, w, 64]   (raw DFL logits)
-  cls shape: [1, h, w, 80]   (raw logits, 80 COCO classes)
-  At 256x256: P3=32x32, P4=16x16, P5=8x8
-
-After export, convert the .onnx to yolov8n_coco_256.m1model.
-Then place it in: ssne_ai_yolo_coco/app_assets/models/yolov8n_coco_256.m1model
-And update coco_config.hpp: kDetShape = {256, 256}
-                             kModelPath = ".../yolov8n_coco_256.m1model"
-
-Usage:
-    python export_coco_256.py
-    python export_coco_256.py --imgsz 416   # for a larger variant
+导出后用工具链转成 .m1model 再部署到板端
 """
 
 import argparse
@@ -25,13 +16,13 @@ import torch.nn as nn
 
 
 def export_coco_head6(
-    model_path: str = "yolov8n.pt",
+    model_path: str = "smart_guard_base.pt",
     imgsz: int = 256,
     opset: int = 11,
 ) -> None:
     from ultralytics import YOLO
 
-    output_path = f"yolov8n_coco_head6_{imgsz}.onnx"
+    output_path = f"smart_guard_coco_head6_{imgsz}.onnx"
 
     yolo = YOLO(model_path)
     inner = yolo.model
@@ -98,17 +89,17 @@ def export_coco_head6(
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f"\n[DONE] {output_path}  ({size_mb:.1f} MB)")
     print("\nNext steps:")
-    print(f"  1. Convert {output_path} -> yolov8n_coco_{imgsz}.m1model")
-    print(f"  2. Copy m1model to board: /app_demo/app_assets/models/yolov8n_coco_{imgsz}.m1model")
+    print(f"  1. Convert {output_path} -> smart_guard_coco_{imgsz}.m1model")
+    print(f"  2. Copy m1model to board: /app_demo/app_assets/models/smart_guard_coco_{imgsz}.m1model")
     print("  3. In coco_config.hpp:")
     print(f"       kDetShape  = {{{imgsz}, {imgsz}}}")
-    print(f"       kModelPath = \"/app_demo/app_assets/models/yolov8n_coco_{imgsz}.m1model\"")
+    print(f"       kModelPath = \"/app_demo/app_assets/models/smart_guard_coco_{imgsz}.m1model\"")
     print("  4. Rebuild and flash")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--imgsz", type=int, default=256, choices=[224, 256, 320, 416, 480])
-    parser.add_argument("--model", type=str, default="yolov8n.pt")
+    parser.add_argument("--model", type=str, default="smart_guard_base.pt")
     args = parser.parse_args()
     export_coco_head6(model_path=args.model, imgsz=args.imgsz)
