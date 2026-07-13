@@ -613,9 +613,12 @@ bool BuildZoneRoi(const GuardZone& zone,
   const int box_height = ymax - ymin + 1;
   const int box_max = std::max(box_width, box_height);
   const int margin = std::max(24, std::min(96, static_cast<int>(std::lround(box_max * 0.12))));
+  const int alignment = coco_config::kRoiAlignment;
   int side = std::max(256, box_max + margin * 2);
+  side = ((side + alignment - 1) / alignment) * alignment;
   const int max_side = std::min(crop_shape[0], crop_shape[1]);
-  if (side > max_side) side = max_side;
+  const int max_aligned_side = (max_side / alignment) * alignment;
+  if (side > max_aligned_side) side = max_aligned_side;
   if (side < box_max) return false;
 
   const int center_x = (xmin + xmax) / 2;
@@ -624,6 +627,9 @@ bool BuildZoneRoi(const GuardZone& zone,
   int y = center_y - side / 2;
   x = std::max(0, std::min(x, crop_shape[0] - side));
   y = std::max(0, std::min(y, crop_shape[1] - side));
+  // Packed YUV422 starts on a two-pixel chroma pair. The ROI dimensions are
+  // additionally aligned for the board's offline AI preprocess pipeline.
+  x -= x % 2;
 
   roi->x = x;
   roi->y = y;
@@ -636,7 +642,10 @@ bool BuildZoneRoiTensor(const ssne_tensor_t& source,
                         const std::array<int, 2>& crop_shape,
                         const ZoneRoiWindow& roi,
                         ssne_tensor_t* output) {
-  if (output == nullptr || !roi.enabled || roi.side <= 0) return false;
+  if (output == nullptr || !roi.enabled || roi.side <= 0 ||
+      roi.side % coco_config::kRoiAlignment != 0 || roi.x % 2 != 0) {
+    return false;
+  }
   output->data = nullptr;
   if (get_data(source) == nullptr ||
       get_data_format(source) != SSNE_YUV422_16 ||
@@ -647,22 +656,29 @@ bool BuildZoneRoiTensor(const ssne_tensor_t& source,
 
   ssne_tensor_t roi_tensor = create_tensor(
       static_cast<uint32_t>(roi.side), static_cast<uint32_t>(roi.side),
-      SSNE_YUV422_16, SSNE_BUF_LINUX);
-  unsigned char* dst = static_cast<unsigned char*>(get_data(roi_tensor));
+      SSNE_YUV422_16, SSNE_BUF_AI);
   const unsigned char* src = static_cast<const unsigned char*>(get_data(source));
-  if (dst == nullptr || src == nullptr) {
+  if (roi_tensor.data == nullptr || src == nullptr) {
     if (roi_tensor.data != nullptr) release_tensor(roi_tensor);
     return false;
   }
 
   const std::size_t row_bytes = static_cast<std::size_t>(roi.side) * 2u;
   const std::size_t source_stride = static_cast<std::size_t>(crop_shape[0]) * 2u;
+  const std::size_t roi_bytes = row_bytes * static_cast<std::size_t>(roi.side);
+  std::vector<unsigned char> packed_roi(roi_bytes);
   for (int row = 0; row < roi.side; ++row) {
     const unsigned char* src_row = src +
         static_cast<std::size_t>(roi.y + row) * source_stride +
         static_cast<std::size_t>(roi.x) * 2u;
-    std::memcpy(dst + static_cast<std::size_t>(row) * row_bytes,
+    std::memcpy(packed_roi.data() + static_cast<std::size_t>(row) * row_bytes,
                 src_row, row_bytes);
+  }
+  if (get_mem_size(roi_tensor) < roi_bytes ||
+      load_tensor_buffer_ptr(roi_tensor, packed_roi.data(),
+                             static_cast<int>(roi_bytes)) != 0) {
+    release_tensor(roi_tensor);
+    return false;
   }
   *output = roi_tensor;
   return true;
@@ -681,11 +697,36 @@ float DetectionIoU(const CocoDetection& a, const CocoDetection& b) {
   return inter / std::max(1e-6f, area_a + area_b - inter);
 }
 
-void MergeRoiDetections(CocoDetectionResult* full_result,
-                        const CocoDetectionResult& roi_result,
-                        const ZoneRoiWindow& roi,
-                        const std::array<int, 2>& crop_shape) {
-  if (full_result == nullptr || !roi.enabled) return;
+bool SameRoiWindow(const ZoneRoiWindow& a, const ZoneRoiWindow& b) {
+  return a.enabled && b.enabled &&
+         a.x == b.x && a.y == b.y && a.side == b.side;
+}
+
+void MergeCropDetections(CocoDetectionResult* full_result,
+                         const CocoDetectionResult& additions,
+                         bool prefer_higher_score) {
+  if (full_result == nullptr) return;
+  for (const CocoDetection& det : additions.detections) {
+    bool duplicate = false;
+    for (CocoDetection& existing : full_result->detections) {
+      if (existing.class_id == det.class_id &&
+          DetectionIoU(existing, det) > coco_config::kNmsThreshold) {
+        duplicate = true;
+        if (prefer_higher_score && det.score > existing.score) existing = det;
+        break;
+      }
+    }
+    if (!duplicate) full_result->detections.push_back(det);
+  }
+}
+
+void MapRoiDetectionsToCrop(const CocoDetectionResult& roi_result,
+                            const ZoneRoiWindow& roi,
+                            const std::array<int, 2>& crop_shape,
+                            CocoDetectionResult* mapped_result) {
+  if (mapped_result == nullptr) return;
+  mapped_result->Clear();
+  if (!roi.enabled) return;
   for (const CocoDetection& source : roi_result.detections) {
     CocoDetection det = source;
     det.box_xyxy[0] += static_cast<float>(roi.x);
@@ -700,15 +741,7 @@ void MergeRoiDetections(CocoDetectionResult* full_result,
     if (det.box_xyxy[2] <= det.box_xyxy[0] || det.box_xyxy[3] <= det.box_xyxy[1]) {
       continue;
     }
-    bool duplicate = false;
-    for (CocoDetection& existing : full_result->detections) {
-      if (existing.class_id == det.class_id && DetectionIoU(existing, det) > coco_config::kNmsThreshold) {
-        duplicate = true;
-        if (det.score > existing.score) existing = det;
-        break;
-      }
-    }
-    if (!duplicate) full_result->detections.push_back(det);
+    mapped_result->detections.push_back(det);
   }
 }
 
@@ -1605,6 +1638,11 @@ int main() {
   int data_fail_count   = 0;
   EnvPolicyState env_state;
   int roi_frame_index = 0;
+  CocoDetectionResult cached_roi_result;
+  ZoneRoiWindow cached_roi_window;
+  auto cached_roi_time = std::chrono::steady_clock::now() -
+                         std::chrono::milliseconds(coco_config::kRoiResultCacheMs + 1);
+  auto roi_retry_after = std::chrono::steady_clock::now();
 
   // 端到端延迟样本环（帧捕获 -> OSD刷新），用于 P95 统计
   std::vector<long long> latency_samples;
@@ -1770,9 +1808,17 @@ int main() {
     // Optional local enhancement: the existing danger zone is the only user
     // configuration. The full-frame result remains authoritative on failures.
     ++roi_frame_index;
-    if (detector_ready && roi_frame_index % 5 == 0) {
-      ZoneRoiWindow roi;
-      if (BuildZoneRoi(active_zone, crop_shape, &roi)) {
+    ZoneRoiWindow roi;
+    const bool roi_enabled = detector_ready &&
+                             BuildZoneRoi(active_zone, crop_shape, &roi);
+    if (!roi_enabled || !SameRoiWindow(roi, cached_roi_window)) {
+      cached_roi_result.Clear();
+      cached_roi_window = ZoneRoiWindow();
+    }
+
+    if (detector_ready &&
+        roi_frame_index % coco_config::kRoiIntervalFrames == 0) {
+      if (roi_enabled && std::chrono::steady_clock::now() >= roi_retry_after) {
         ssne_tensor_t roi_tensor;
         if (BuildZoneRoiTensor(img_sensor, crop_shape, roi, &roi_tensor)) {
           CocoDetectionResult roi_result;
@@ -1780,19 +1826,47 @@ int main() {
           ++accept_stats.roi_runs;
           if (detector.Predict(&roi_tensor, &roi_result,
                                env_state.conf_threshold, &roi_shape)) {
-            MergeRoiDetections(&det_result, roi_result, roi, crop_shape);
+            CocoDetectionResult mapped_roi_result;
+            MapRoiDetectionsToCrop(roi_result, roi, crop_shape,
+                                   &mapped_roi_result);
+            MergeCropDetections(&det_result, mapped_roi_result, true);
+            if (!mapped_roi_result.detections.empty()) {
+              cached_roi_result = mapped_roi_result;
+              cached_roi_window = roi;
+              cached_roi_time = std::chrono::steady_clock::now();
+            }
+            roi_retry_after = std::chrono::steady_clock::now();
           } else {
             ++accept_stats.roi_failures;
+            roi_retry_after = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(
+                                  coco_config::kRoiFailureBackoffMs);
             fprintf(stderr, "[ROI][WARN] local inference failed; using full-frame result\n");
           }
           release_tensor(roi_tensor);
         } else {
           ++accept_stats.roi_failures;
+          roi_retry_after = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(
+                                coco_config::kRoiFailureBackoffMs);
           fprintf(stderr, "[ROI][WARN] local tensor creation failed; using full-frame result\n");
         }
       } else if (active_zone.active) {
         ++accept_stats.roi_skipped;
       }
+    }
+
+    const auto roi_cache_age_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cached_roi_time).count();
+    if (roi_enabled && SameRoiWindow(roi, cached_roi_window) &&
+        roi_cache_age_ms <= coco_config::kRoiResultCacheMs) {
+      // Cached local detections fill the four frames between ROI runs. Fresh
+      // full-frame boxes remain authoritative when the two sources overlap.
+      MergeCropDetections(&det_result, cached_roi_result, false);
+    } else if (roi_cache_age_ms > coco_config::kRoiResultCacheMs) {
+      cached_roi_result.Clear();
+      cached_roi_window = ZoneRoiWindow();
     }
 
     // 追踪和区域判断都在裁剪坐标系(1440x1080)下完成
