@@ -266,9 +266,19 @@ bool ParseArmMode(const std::string& text, ArmMode* mode) {
 }
 
 bool ModeAllowsAlarmClass(int class_id, ArmMode mode) {
-  // Preserve the current all-class behavior in AWAY mode. HOME/SLEEP focus
-  // on people to reduce routine pet activity from becoming an alarm.
+  // HOME and SLEEP are human-safety modes: a person entering the danger zone
+  // is the primary risk. AWAY is unattended protection and includes all
+  // configured alarm classes, including pets.
   return mode == ArmMode::kAway || class_id == 0;
+}
+
+GpioAlarmMode GpioModeForArmMode(ArmMode mode) {
+  switch (mode) {
+    case ArmMode::kAway: return GpioAlarmMode::kAway;
+    case ArmMode::kSleep: return GpioAlarmMode::kSleep;
+    case ArmMode::kHome:
+    default: return GpioAlarmMode::kHome;
+  }
 }
 
 struct AlarmLifecycle {
@@ -1832,7 +1842,8 @@ int main() {
 
     // GPIO 报警仅在 zone 内触发（更准确反映安防意图）
     if (gpio_ready) {
-      gpio_alarm.Update(is_alarm_active, env_state.alarm_hold_ms);
+      gpio_alarm.Update(is_alarm_active, env_state.alarm_hold_ms,
+                        GpioModeForArmMode(arm_mode));
     }
 
     // 显示/隐藏英文 ALERT 报警位图

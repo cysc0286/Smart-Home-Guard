@@ -22,7 +22,8 @@ GpioAlarmController::GpioAlarmController()
       buzzer_level_high_(false),
       last_toggle_ms_(0),
       last_update_call_ms_(0),
-      last_object_seen_ms_(0) {}
+      last_object_seen_ms_(0),
+      mode_(GpioAlarmMode::kHome) {}
 
 GpioAlarmController::~GpioAlarmController() {
   Release();
@@ -90,10 +91,14 @@ void GpioAlarmController::SetBuzzer(bool on) {
 }
 
 void GpioAlarmController::Update(bool has_object) {
-  Update(has_object, coco_config::kAlarmHoldMs);
+  Update(has_object, coco_config::kAlarmHoldMs, GpioAlarmMode::kHome);
 }
 
 void GpioAlarmController::Update(bool has_object, int hold_ms) {
+  Update(has_object, hold_ms, GpioAlarmMode::kHome);
+}
+
+void GpioAlarmController::Update(bool has_object, int hold_ms, GpioAlarmMode mode) {
   if (!initialized_) {
     return;
   }
@@ -109,6 +114,13 @@ void GpioAlarmController::Update(bool has_object, int hold_ms) {
   const bool alarm_active = has_object ||
       (last_object_seen_ms_ > 0 &&
        (now_ms - last_object_seen_ms_) < hold_ms);
+
+  if (mode_ != mode) {
+    mode_ = mode;
+    // 模式切换后从一个完整的静音周期重新开始，避免切换瞬间产生半拍脉冲。
+    buzzer_on_ = false;
+    last_toggle_ms_ = now_ms;
+  }
 
   if (!alarm_active) {
     SetLed(false);
@@ -127,7 +139,21 @@ void GpioAlarmController::Update(bool has_object, int hold_ms) {
 
   SetLed(true);
 
-  const int phase_ms = buzzer_on_ ? kBuzzerOnMs : kBuzzerOffMs;
+  // GPIO 蜂鸣器的响度由硬件供电和器件决定；这里通过占空比提高提醒强度。
+  // SLEEP 使用长响短停，确保夜间危险事件能唤醒用户。
+  int buzzer_on_ms = kBuzzerOnMs;
+  int buzzer_off_ms = kBuzzerOffMs;
+  if (mode_ == GpioAlarmMode::kHome) {
+    buzzer_on_ms = 120;
+    buzzer_off_ms = 380;
+  } else if (mode_ == GpioAlarmMode::kAway) {
+    buzzer_on_ms = 260;
+    buzzer_off_ms = 140;
+  } else if (mode_ == GpioAlarmMode::kSleep) {
+    buzzer_on_ms = 900;
+    buzzer_off_ms = 100;
+  }
+  const int phase_ms = buzzer_on_ ? buzzer_on_ms : buzzer_off_ms;
   if ((now_ms - last_toggle_ms_) >= phase_ms) {
     buzzer_on_ = !buzzer_on_;
     last_toggle_ms_ = now_ms;
@@ -155,6 +181,7 @@ void GpioAlarmController::Release() {
   last_toggle_ms_ = 0;
   last_update_call_ms_ = 0;
   last_object_seen_ms_ = 0;
+  mode_ = GpioAlarmMode::kHome;
 
   printf("[GPIO] Released.\n");
 }

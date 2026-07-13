@@ -2,6 +2,12 @@
 
 #include <stdint.h>
 
+enum class GpioAlarmMode {
+  kHome,
+  kAway,
+  kSleep,
+};
+
 class GpioAlarmController {
  public:
   GpioAlarmController();
@@ -10,6 +16,7 @@ class GpioAlarmController {
   bool Initialize();
   void Update(bool has_object);
   void Update(bool has_object, int hold_ms);
+  void Update(bool has_object, int hold_ms, GpioAlarmMode mode);
   void Release();
 
  private:
@@ -24,6 +31,7 @@ class GpioAlarmController {
   long long last_toggle_ms_;
   long long last_update_call_ms_;
   long long last_object_seen_ms_;
+  GpioAlarmMode mode_;
 
   static const uint16_t kLedPin;
   static const uint16_t kBuzzerPin;
