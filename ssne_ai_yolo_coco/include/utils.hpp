@@ -20,19 +20,20 @@ class VISUALIZER {
     void Draw();
     void Draw(const std::vector<std::array<float, 4>>& boxes);
 
-    // OSD 图层分配: 0=检测框  1=危险区域  2=报警位图
+    // OSD 图层分配: 0=检测框  1=矩形危险区域  2=多边形危险区域位图  3=报警位图
     static const int DETECTION_LAYER_ID = 0;
     static const int ZONE_LAYER_ID      = 1;
-    static const int ALARM_LAYER_ID     = 2;
+    static const int ZONE_BITMAP_LAYER_ID = 2;
+    static const int ALARM_LAYER_ID     = 3;
 
     // 正常框(绿) + 报警框(红) 同帧绘制到 layer 0
     void DrawDetections(const std::vector<std::array<float, 4>>& normal_boxes,
                         const std::vector<std::array<float, 4>>& alarm_boxes);
 
     void DrawZoneRect(int x1, int y1, int x2, int y2);
-    // 多边形显示用外接矩形近似，判断走真实多边形
+    // 外接矩形仅作为RLE多边形显示失败时的降级路径。
     void DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& points);
-    void DrawZonePolygon(const std::vector<std::array<int, 2>>& points);
+    bool DrawZonePolygon(const std::vector<std::array<int, 2>>& points);
     void ClearZoneOverlay();
 
     void ShowAlarmIndicator(int pos_x = 30, int pos_y = 30);
@@ -48,4 +49,5 @@ class VISUALIZER {
     int m_height = 0;
     std::string m_bitmap_lut_path_full;
     bool m_alarm_indicator_visible = false;
+    std::string m_zone_bitmap_path = "/tmp/smart_home_guard_zone.ssbmp";
 };

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <cstdio>
+#include <cstdint>
 
 namespace utils {
 
@@ -233,7 +234,7 @@ void VISUALIZER::DrawZoneRect(int x1, int y1, int x2, int y2) {
                     coco_config::kColorZoneBox);
 }
 
-// OSD不支持多段线，用多边形的外接矩形框代替显示；实际判断仍走 point-in-polygon
+// 外接矩形降级显示；实际判断始终走 point-in-polygon。
 void VISUALIZER::DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& points) {
     if (points.size() < 3) return;
     int xmin = points[0][0];
@@ -249,74 +250,130 @@ void VISUALIZER::DrawZonePolygonBBox(const std::vector<std::array<int, 2>>& poin
     DrawZoneRect(xmin, ymin, xmax, ymax);
 }
 
-// 用小实心方块沿边采样拟合多边形轮廓，MAX_QUADS上限防爆DMA buffer
-void VISUALIZER::DrawZonePolygon(const std::vector<std::array<int, 2>>& points) {
-    if (points.size() < 3) return;
+// 将多边形轮廓栅格化为透明底SSBMP。相比“小方块拼线”，RLE位图不受每层32个四边形、
+// 同一扫描行最多4个四边形的限制；危险区只在配置变化时更新，不进入逐帧检测热路径。
+bool VISUALIZER::DrawZonePolygon(const std::vector<std::array<int, 2>>& points) {
+    if (points.size() < 3 || m_width <= 0 || m_height <= 0) return false;
 
-    const int T = coco_config::kZoneBorderPx;
-    const int MAX_QUADS = 450;
-    const std::size_t n = points.size();
-
-    int total_len = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        int dx = points[(i + 1) % n][0] - points[i][0];
-        int dy = points[(i + 1) % n][1] - points[i][1];
-        total_len += std::max(std::abs(dx), std::abs(dy));
+    std::vector<std::array<int, 2>> clipped;
+    clipped.reserve(points.size());
+    for (const auto& p : points) {
+        std::array<int, 2> q = {{
+            std::max(0, std::min(p[0], m_width - 1)),
+            std::max(0, std::min(p[1], m_height - 1))
+        }};
+        if (clipped.empty() || clipped.back() != q) clipped.push_back(q);
     }
-    if (total_len == 0) return;
+    if (clipped.size() > 1 && clipped.front() == clipped.back()) clipped.pop_back();
+    if (clipped.size() < 3) return false;
 
-    const int step = std::max(T, (total_len + MAX_QUADS - 1) / MAX_QUADS);
-    const int half = step / 2;
+    long long twice_area = 0;
+    for (std::size_t i = 0; i < clipped.size(); ++i) {
+        const auto& a = clipped[i];
+        const auto& b = clipped[(i + 1) % clipped.size()];
+        twice_area += static_cast<long long>(a[0]) * b[1] -
+                      static_cast<long long>(b[0]) * a[1];
+    }
+    if (twice_area == 0) return false;
 
-    std::vector<sst::device::osd::OsdQuadRangle> quads;
-    quads.reserve(MAX_QUADS);
+    int xmin = clipped[0][0], xmax = xmin;
+    int ymin = clipped[0][1], ymax = ymin;
+    for (const auto& p : clipped) {
+        xmin = std::min(xmin, p[0]);
+        xmax = std::max(xmax, p[0]);
+        ymin = std::min(ymin, p[1]);
+        ymax = std::max(ymax, p[1]);
+    }
 
-    for (std::size_t i = 0; i < n; ++i) {
-        const int ax = points[i][0];
-        const int ay = points[i][1];
-        const int bx = points[(i + 1) % n][0];
-        const int by = points[(i + 1) % n][1];
-        const int dx = bx - ax;
-        const int dy = by - ay;
-        const int len = std::max(std::abs(dx), std::abs(dy));
-        if (len == 0) continue;
+    const int radius = std::max(1, coco_config::kZoneBorderPx / 2);
+    xmin = std::max(0, xmin - radius);
+    ymin = std::max(0, ymin - radius);
+    xmax = std::min(m_width - 1, xmax + radius);
+    ymax = std::min(m_height - 1, ymax + radius);
+    // YUV相邻像素共享色度，贴图左上角对齐偶数坐标可减少彩色轮廓边缘失真。
+    if ((xmin & 1) != 0) --xmin;
+    if ((ymin & 1) != 0) --ymin;
+    const int bitmap_width = xmax - xmin + 1;
+    const int bitmap_height = ymax - ymin + 1;
+    if (bitmap_width <= 0 || bitmap_height <= 0) return false;
 
-        for (int s = 0; s <= len; s += step) {
-            const float t  = static_cast<float>(s) / static_cast<float>(len);
-            const int   px = ax + static_cast<int>(t * dx + 0.5f);
-            const int   py = ay + static_cast<int>(t * dy + 0.5f);
+    const uint8_t transparent_index = 31;
+    const uint8_t zone_color = static_cast<uint8_t>(coco_config::kColorZoneBox);
+    std::vector<uint8_t> pixels(static_cast<std::size_t>(bitmap_width) * bitmap_height,
+                                transparent_index);
 
-            const int x1 = std::max(0, px - half);
-            const int y1 = std::max(0, py - half);
-            const int x2 = std::min(m_width  - 1, px + half);
-            const int y2 = std::min(m_height - 1, py + half);
-            if (x2 <= x1 || y2 <= y1) continue;
+    auto stamp = [&](int x, int y) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            const int py = y + dy;
+            if (py < 0 || py >= bitmap_height) continue;
+            for (int dx = -radius; dx <= radius; ++dx) {
+                const int px = x + dx;
+                if (px < 0 || px >= bitmap_width) continue;
+                pixels[static_cast<std::size_t>(py) * bitmap_width + px] = zone_color;
+            }
+        }
+    };
 
-            sst::device::osd::OsdQuadRangle q;
-            q.box      = {static_cast<float>(x1), static_cast<float>(y1),
-                          static_cast<float>(x2), static_cast<float>(y2)};
-            q.color    = coco_config::kColorZoneBox;
-            q.border   = 0;
-            q.alpha    = fdevice::TYPE_ALPHA100;
-            q.type     = fdevice::TYPE_SOLID;
-            q.layer_id = ZONE_LAYER_ID;
-            quads.emplace_back(q);
+    // 整数Bresenham逐边绘制，顶点处重复stamp可自然封闭接缝。
+    for (std::size_t i = 0; i < clipped.size(); ++i) {
+        int x0 = clipped[i][0] - xmin;
+        int y0 = clipped[i][1] - ymin;
+        const int x1 = clipped[(i + 1) % clipped.size()][0] - xmin;
+        const int y1 = clipped[(i + 1) % clipped.size()][1] - ymin;
+        const int dx = std::abs(x1 - x0);
+        const int sx = x0 < x1 ? 1 : -1;
+        const int dy = -std::abs(y1 - y0);
+        const int sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        while (true) {
+            stamp(x0, y0);
+            if (x0 == x1 && y0 == y1) break;
+            const int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
         }
     }
 
-    if (!quads.empty())
-        osd_device.Draw(quads, ZONE_LAYER_ID);
+    const std::string temp_path = m_zone_bitmap_path + ".tmp";
+    std::ofstream file(temp_path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!file) {
+        std::cerr << "[ZONE][OSD] cannot create " << temp_path << std::endl;
+        return false;
+    }
+    const char magic[4] = {'M', 'B', 'S', 'S'};
+    const int32_t header[3] = {bitmap_width, bitmap_height, 32};
+    file.write(magic, sizeof(magic));
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(pixels.data()),
+               static_cast<std::streamsize>(pixels.size()));
+    file.close();
+    if (!file || std::rename(temp_path.c_str(), m_zone_bitmap_path.c_str()) != 0) {
+        std::cerr << "[ZONE][OSD] failed to finalize polygon bitmap" << std::endl;
+        std::remove(temp_path.c_str());
+        return false;
+    }
+
+    const bool drawn = osd_device.DrawTexture(m_zone_bitmap_path.c_str(), nullptr,
+                                               ZONE_BITMAP_LAYER_ID, xmin, ymin,
+                                               fdevice::TYPE_ALPHA100);
+    if (drawn) {
+        std::cout << "[ZONE][OSD] polygon-rle points=" << clipped.size()
+                  << " bitmap=" << bitmap_width << "x" << bitmap_height
+                  << " pos=" << xmin << "," << ymin << std::endl;
+    }
+    return drawn;
 }
 
 void VISUALIZER::ClearZoneOverlay() {
     osd_device.ClearLayer(ZONE_LAYER_ID);
+    osd_device.ClearLayer(ZONE_BITMAP_LAYER_ID);
 }
 
 void VISUALIZER::ShowAlarmIndicator(int pos_x, int pos_y) {
     if (m_alarm_indicator_visible) return;
     const std::string path = "/app_demo/app_assets/" + std::string(coco_config::kAlarmBitmapName);
-    osd_device.DrawTexture(path.c_str(), nullptr, ALARM_LAYER_ID, pos_x, pos_y);
-    m_alarm_indicator_visible = true;
+    m_alarm_indicator_visible =
+        osd_device.DrawTexture(path.c_str(), nullptr, ALARM_LAYER_ID, pos_x, pos_y);
 }
 
 void VISUALIZER::HideAlarmIndicator() {
@@ -356,5 +413,7 @@ void VISUALIZER::DrawBitmap(const std::string& bitmap_path, const std::string& l
 }
 
 void VISUALIZER::Release() {
+    std::remove(m_zone_bitmap_path.c_str());
+    std::remove((m_zone_bitmap_path + ".tmp").c_str());
     osd_device.Release();
 }

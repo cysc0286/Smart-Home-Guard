@@ -14,8 +14,9 @@
 #include "common.hpp"
 
 #define BUFFER_TYPE_DMABUF  0x1
-// 3 层布局：layer0 检测框（白/红） | layer1 危险区域黄色框 | layer2 报警位图（英文ALERT）
-#define OSD_LAYER_SIZE 3
+// 4 层布局：layer0 检测框 | layer1 矩形危险区域 | layer2 多边形危险区域位图 | layer3 ALERT位图
+// 位图资源不足时优先保证先创建的多边形图层。
+#define OSD_LAYER_SIZE 4
 
 namespace sst{
 namespace device{
@@ -51,7 +52,7 @@ public:
      * @param alpha 透明度
      * @description 在位图图层上绘制位图，位置在整个图像上
      */
-    void DrawTexture(const char* bitmap_path, const char* lut_path, int layer_id, int pos_x = 0, int pos_y = 0, fdevice::ALPHATYPE alpha = fdevice::TYPE_ALPHA100);
+    bool DrawTexture(const char* bitmap_path, const char* lut_path, int layer_id, int pos_x = 0, int pos_y = 0, fdevice::ALPHATYPE alpha = fdevice::TYPE_ALPHA100);
 
     /**
      * @brief 清空指定图层
@@ -64,14 +65,14 @@ private:
     void GenQrangleBox(std::array<float, 4>& det, int border);
 
 private:
-    handle_t m_osd_handle;
+    handle_t m_osd_handle = INVALID_HANDLE;
     std::string m_osd_lut_path = "/app_demo/app_assets/colorLUT.sscl";
     // std::string m_texture_path = "/ai/imgs/test_24.ssbmp";
     uint8_t *m_pcolor_lut = nullptr;
     int m_file_size = 0;
     int m_height, m_width;
     
-    fdevice::DMA_BUFFER_ATTR_S m_layer_dma[OSD_LAYER_SIZE];
+    fdevice::DMA_BUFFER_ATTR_S m_layer_dma[OSD_LAYER_SIZE] = {};
     fdevice::VERTEXS_S m_qrangle_out={0}, m_qrangle_in={0};
 };
 

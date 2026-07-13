@@ -1042,7 +1042,8 @@ void ClassifyDetections(const CocoDetectionResult& result,
   }
 }
 
-// zone坐标存在裁剪空间(1440x1080)，OSD显示用外接矩形，判断用真实多边形
+// zone坐标存在裁剪空间(1440x1080)，OSD显示和判断均使用真实多边形。
+// OSD位图提交失败时降级为外接矩形，避免危险区完全不可见。
 void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
   if (visualizer == nullptr) return;
   visualizer->ClearZoneOverlay();
@@ -1053,8 +1054,13 @@ void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
     for (const auto& p : zone.points) {
       pts.push_back({p.x + coco_config::kCropOffsetX, p.y});
     }
-    printf("[ZONE] judgement=polygon display=bbox points=%zu\n", zone.points.size());
-    visualizer->DrawZonePolygonBBox(pts);
+    if (visualizer->DrawZonePolygon(pts)) {
+      printf("[ZONE] judgement=polygon display=polygon-rle points=%zu\n", zone.points.size());
+    } else {
+      printf("[ZONE][WARN] polygon OSD failed; fallback display=bbox points=%zu\n",
+             zone.points.size());
+      visualizer->DrawZonePolygonBBox(pts);
+    }
   } else {
     printf("[ZONE] judgement=rect display=rect\n");
     visualizer->DrawZoneRect(zone.X1() + coco_config::kCropOffsetX,
