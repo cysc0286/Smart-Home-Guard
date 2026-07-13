@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -77,6 +78,9 @@ struct AcceptanceStats {
   int data_recoveries = 0;
   int infer_failures = 0;
   int resource_warnings = 0;
+  int roi_runs = 0;
+  int roi_failures = 0;
+  int roi_skipped = 0;
   bool summary_printed = false;
   std::vector<long long> latency_ms;
 };
@@ -228,6 +232,122 @@ struct GuardZone {
     return ids;
   }
 };
+
+enum class ArmMode {
+  kHome,
+  kAway,
+  kSleep,
+};
+
+const char* ArmModeName(ArmMode mode) {
+  switch (mode) {
+    case ArmMode::kAway: return "AWAY";
+    case ArmMode::kSleep: return "SLEEP";
+    case ArmMode::kHome:
+    default: return "HOME";
+  }
+}
+
+bool ParseArmMode(const std::string& text, ArmMode* mode) {
+  if (mode == nullptr) return false;
+  if (text == "HOME") {
+    *mode = ArmMode::kHome;
+    return true;
+  }
+  if (text == "AWAY") {
+    *mode = ArmMode::kAway;
+    return true;
+  }
+  if (text == "SLEEP") {
+    *mode = ArmMode::kSleep;
+    return true;
+  }
+  return false;
+}
+
+bool ModeAllowsAlarmClass(int class_id, ArmMode mode) {
+  // Preserve the current all-class behavior in AWAY mode. HOME/SLEEP focus
+  // on people to reduce routine pet activity from becoming an alarm.
+  return mode == ArmMode::kAway || class_id == 0;
+}
+
+struct AlarmLifecycle {
+  bool active = false;
+  long long last_raw_active_ms = 0;
+  long long started_ms = 0;
+  int starts = 0;
+  int ends = 0;
+  CocoDetection last_detection;
+  bool has_detection = false;
+
+  bool Update(bool raw_active, long long now_ms, const CocoDetection* best_detection) {
+    if (raw_active) {
+      last_raw_active_ms = now_ms;
+      if (best_detection != nullptr) {
+        last_detection = *best_detection;
+        has_detection = true;
+      }
+      if (!active) {
+        active = true;
+        started_ms = now_ms;
+        ++starts;
+        return true;
+      }
+      return false;
+    }
+
+    if (active && last_raw_active_ms > 0 &&
+        now_ms - last_raw_active_ms > coco_config::kAlarmEventClearMs) {
+      active = false;
+      ++ends;
+      return true;
+    }
+    return false;
+  }
+};
+
+std::string WallClockText() {
+  const std::time_t now = std::time(nullptr);
+  std::tm local_time;
+  localtime_r(&now, &local_time);
+  char buffer[32] = {0};
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_time);
+  return std::string(buffer);
+}
+
+void AppendAlarmEvent(const char* event_name,
+                      const CocoDetection* best_detection,
+                      long long duration_ms) {
+  const char* class_name =
+      best_detection == nullptr ? "none" : best_detection->label.c_str();
+  const float score = best_detection == nullptr ? 0.0f : best_detection->score;
+
+  if (access(coco_config::kAlarmEventLogPath, F_OK) == 0) {
+    const long file_size =
+        static_cast<long>(std::ifstream(coco_config::kAlarmEventLogPath,
+                                        std::ios::binary | std::ios::ate).tellg());
+    if (file_size > coco_config::kAlarmEventMaxBytes) {
+      std::ofstream reset(coco_config::kAlarmEventLogPath,
+                          std::ios::binary | std::ios::trunc);
+      reset << "# HALO alarm events\n";
+    }
+  }
+
+  std::ofstream output(coco_config::kAlarmEventLogPath,
+                       std::ios::out | std::ios::app);
+  if (!output.is_open()) {
+    fprintf(stderr, "[EVENT][WARN] Cannot open event log: %s\n",
+            coco_config::kAlarmEventLogPath);
+    return;
+  }
+  output << WallClockText() << " event=" << event_name
+         << " class=" << class_name
+         << " score=" << score
+         << " duration_ms=" << duration_ms << "\n";
+  output.close();
+  printf("[EVENT] %s class=%s score=%.2f duration_ms=%lld\n",
+         event_name, class_name, score, duration_ms);
+}
 
 class SnapshotHttpServer {
  public:
@@ -403,6 +523,182 @@ void ConvertCropBoxesToOriginal(std::vector<std::array<float, 4>>* boxes) {
   for (auto& box : *boxes) {
     box[0] += static_cast<float>(coco_config::kCropOffsetX);
     box[2] += static_cast<float>(coco_config::kCropOffsetX);
+  }
+}
+
+struct ZoneRoiWindow {
+  int x = 0;
+  int y = 0;
+  int side = 0;
+  double area_ratio = 0.0;
+  bool enabled = false;
+};
+
+double PolygonAreaRatio(const GuardZone& zone, const std::array<int, 2>& crop_shape) {
+  if (crop_shape[0] <= 0 || crop_shape[1] <= 0) {
+    return 0.0;
+  }
+  if (zone.shape == "rect" && zone.points.size() >= 2) {
+    const double width = std::abs(zone.points[1].x - zone.points[0].x);
+    const double height = std::abs(zone.points[1].y - zone.points[0].y);
+    return (width * height) /
+           (static_cast<double>(crop_shape[0]) * crop_shape[1]);
+  }
+  if (zone.points.size() < 3) return 0.0;
+  double area_twice = 0.0;
+  for (std::size_t i = 0; i < zone.points.size(); ++i) {
+    const ZonePoint& a = zone.points[i];
+    const ZonePoint& b = zone.points[(i + 1) % zone.points.size()];
+    area_twice += static_cast<double>(a.x) * b.y - static_cast<double>(b.x) * a.y;
+  }
+  const double area = std::abs(area_twice) * 0.5;
+  return area / (static_cast<double>(crop_shape[0]) * crop_shape[1]);
+}
+
+bool BuildZoneRoi(const GuardZone& zone,
+                  const std::array<int, 2>& crop_shape,
+                  ZoneRoiWindow* roi) {
+  if (roi == nullptr) return false;
+  *roi = ZoneRoiWindow();
+  if (!zone.active || crop_shape[0] <= 0 || crop_shape[1] <= 0) return false;
+  for (const ZonePoint& point : zone.points) {
+    if (point.x < 0 || point.y < 0 ||
+        point.x >= crop_shape[0] || point.y >= crop_shape[1]) {
+      return false;
+    }
+  }
+
+  const double area_ratio = PolygonAreaRatio(zone, crop_shape);
+  roi->area_ratio = area_ratio;
+  // A very large zone has little scale benefit and would add unnecessary load.
+  if (area_ratio > 0.80) return false;
+
+  int xmin = crop_shape[0] - 1;
+  int ymin = crop_shape[1] - 1;
+  int xmax = 0;
+  int ymax = 0;
+  if (zone.shape == "rect" && zone.points.size() >= 2) {
+    xmin = std::min(zone.points[0].x, zone.points[1].x);
+    xmax = std::max(zone.points[0].x, zone.points[1].x);
+    ymin = std::min(zone.points[0].y, zone.points[1].y);
+    ymax = std::max(zone.points[0].y, zone.points[1].y);
+  } else if (zone.points.size() >= 3) {
+    for (const ZonePoint& point : zone.points) {
+      xmin = std::min(xmin, point.x);
+      ymin = std::min(ymin, point.y);
+      xmax = std::max(xmax, point.x);
+      ymax = std::max(ymax, point.y);
+    }
+  } else {
+    return false;
+  }
+
+  xmin = std::max(0, std::min(xmin, crop_shape[0] - 1));
+  xmax = std::max(0, std::min(xmax, crop_shape[0] - 1));
+  ymin = std::max(0, std::min(ymin, crop_shape[1] - 1));
+  ymax = std::max(0, std::min(ymax, crop_shape[1] - 1));
+  if (xmax <= xmin || ymax <= ymin) return false;
+
+  const int box_width = xmax - xmin + 1;
+  const int box_height = ymax - ymin + 1;
+  const int box_max = std::max(box_width, box_height);
+  const int margin = std::max(24, std::min(96, static_cast<int>(std::lround(box_max * 0.12))));
+  int side = std::max(256, box_max + margin * 2);
+  const int max_side = std::min(crop_shape[0], crop_shape[1]);
+  if (side > max_side) side = max_side;
+  if (side < box_max) return false;
+
+  const int center_x = (xmin + xmax) / 2;
+  const int center_y = (ymin + ymax) / 2;
+  int x = center_x - side / 2;
+  int y = center_y - side / 2;
+  x = std::max(0, std::min(x, crop_shape[0] - side));
+  y = std::max(0, std::min(y, crop_shape[1] - side));
+
+  roi->x = x;
+  roi->y = y;
+  roi->side = side;
+  roi->enabled = true;
+  return true;
+}
+
+bool BuildZoneRoiTensor(const ssne_tensor_t& source,
+                        const std::array<int, 2>& crop_shape,
+                        const ZoneRoiWindow& roi,
+                        ssne_tensor_t* output) {
+  if (output == nullptr || !roi.enabled || roi.side <= 0) return false;
+  output->data = nullptr;
+  if (get_data(source) == nullptr ||
+      get_data_format(source) != SSNE_YUV422_16 ||
+      static_cast<int>(get_width(source)) != crop_shape[0] ||
+      static_cast<int>(get_height(source)) != crop_shape[1]) {
+    return false;
+  }
+
+  ssne_tensor_t roi_tensor = create_tensor(
+      static_cast<uint32_t>(roi.side), static_cast<uint32_t>(roi.side),
+      SSNE_YUV422_16, SSNE_BUF_LINUX);
+  unsigned char* dst = static_cast<unsigned char*>(get_data(roi_tensor));
+  const unsigned char* src = static_cast<const unsigned char*>(get_data(source));
+  if (dst == nullptr || src == nullptr) {
+    if (roi_tensor.data != nullptr) release_tensor(roi_tensor);
+    return false;
+  }
+
+  const std::size_t row_bytes = static_cast<std::size_t>(roi.side) * 2u;
+  const std::size_t source_stride = static_cast<std::size_t>(crop_shape[0]) * 2u;
+  for (int row = 0; row < roi.side; ++row) {
+    const unsigned char* src_row = src +
+        static_cast<std::size_t>(roi.y + row) * source_stride +
+        static_cast<std::size_t>(roi.x) * 2u;
+    std::memcpy(dst + static_cast<std::size_t>(row) * row_bytes,
+                src_row, row_bytes);
+  }
+  *output = roi_tensor;
+  return true;
+}
+
+float DetectionIoU(const CocoDetection& a, const CocoDetection& b) {
+  const float x1 = std::max(a.box_xyxy[0], b.box_xyxy[0]);
+  const float y1 = std::max(a.box_xyxy[1], b.box_xyxy[1]);
+  const float x2 = std::min(a.box_xyxy[2], b.box_xyxy[2]);
+  const float y2 = std::min(a.box_xyxy[3], b.box_xyxy[3]);
+  const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+  const float area_a = std::max(0.0f, a.box_xyxy[2] - a.box_xyxy[0]) *
+                       std::max(0.0f, a.box_xyxy[3] - a.box_xyxy[1]);
+  const float area_b = std::max(0.0f, b.box_xyxy[2] - b.box_xyxy[0]) *
+                       std::max(0.0f, b.box_xyxy[3] - b.box_xyxy[1]);
+  return inter / std::max(1e-6f, area_a + area_b - inter);
+}
+
+void MergeRoiDetections(CocoDetectionResult* full_result,
+                        const CocoDetectionResult& roi_result,
+                        const ZoneRoiWindow& roi,
+                        const std::array<int, 2>& crop_shape) {
+  if (full_result == nullptr || !roi.enabled) return;
+  for (const CocoDetection& source : roi_result.detections) {
+    CocoDetection det = source;
+    det.box_xyxy[0] += static_cast<float>(roi.x);
+    det.box_xyxy[1] += static_cast<float>(roi.y);
+    det.box_xyxy[2] += static_cast<float>(roi.x);
+    det.box_xyxy[3] += static_cast<float>(roi.y);
+    for (int axis = 0; axis < 2; ++axis) {
+      const float limit = static_cast<float>(crop_shape[axis] - 1);
+      det.box_xyxy[axis] = std::max(0.0f, std::min(det.box_xyxy[axis], limit));
+      det.box_xyxy[axis + 2] = std::max(0.0f, std::min(det.box_xyxy[axis + 2], limit));
+    }
+    if (det.box_xyxy[2] <= det.box_xyxy[0] || det.box_xyxy[3] <= det.box_xyxy[1]) {
+      continue;
+    }
+    bool duplicate = false;
+    for (CocoDetection& existing : full_result->detections) {
+      if (existing.class_id == det.class_id && DetectionIoU(existing, det) > coco_config::kNmsThreshold) {
+        duplicate = true;
+        if (det.score > existing.score) existing = det;
+        break;
+      }
+    }
+    if (!duplicate) full_result->detections.push_back(det);
   }
 }
 
@@ -681,8 +977,9 @@ void FilterDetectionsByZone(CocoDetectionResult* result, const GuardZone& zone) 
 
 // 划分正常/报警检测：如果 zone 激活且 det 在 zone 内 + 类别属于报警类 -> 报警；否则正常
 void ClassifyDetections(const CocoDetectionResult& result,
-                        const GuardZone& zone,
-                        std::vector<std::array<float, 4>>* normal_boxes,
+                         const GuardZone& zone,
+                         ArmMode mode,
+                         std::vector<std::array<float, 4>>* normal_boxes,
                         std::vector<std::array<float, 4>>* alarm_boxes) {
   normal_boxes->clear();
   alarm_boxes->clear();
@@ -694,7 +991,7 @@ void ClassifyDetections(const CocoDetectionResult& result,
     bool is_alarm_class = std::find(alarm_ids.begin(), alarm_ids.end(), det.class_id) !=
                           alarm_ids.end();
     bool inside = zone.active && IsDetectionInsideZone(det, zone);
-    if (is_alarm_class && inside) {
+    if (is_alarm_class && ModeAllowsAlarmClass(det.class_id, mode) && inside) {
       alarm_boxes->push_back(det.box_xyxy);
     } else {
       normal_boxes->push_back(det.box_xyxy);
@@ -724,7 +1021,8 @@ void RefreshZoneOverlay(VISUALIZER* visualizer, const GuardZone& zone) {
   }
 }
 
-void FilterDetectionsByAlarmClasses(CocoDetectionResult* result, const GuardZone& zone) {
+void FilterDetectionsByAlarmClasses(CocoDetectionResult* result,
+                                    const GuardZone& zone) {
   const std::vector<int>& alarm_class_ids = zone.alarm_class_ids.empty()
       ? GuardZone::DefaultAlarmClassIds()
       : zone.alarm_class_ids;
@@ -732,11 +1030,28 @@ void FilterDetectionsByAlarmClasses(CocoDetectionResult* result, const GuardZone
   filtered.reserve(result->detections.size());
   for (const auto& det : result->detections) {
     if (std::find(alarm_class_ids.begin(), alarm_class_ids.end(), det.class_id) !=
-        alarm_class_ids.end()) {
+            alarm_class_ids.end()) {
       filtered.push_back(det);
     }
   }
   result->detections.swap(filtered);
+}
+
+bool FindBestAlarmDetection(const CocoDetectionResult& result,
+                            const GuardZone& zone,
+                            ArmMode mode,
+                            CocoDetection* best) {
+  if (best == nullptr) return false;
+  bool found = false;
+  for (const auto& det : result.detections) {
+    if (!zone.active || !ModeAllowsAlarmClass(det.class_id, mode) ||
+        !IsDetectionInsideZone(det, zone)) continue;
+    if (!found || det.score > best->score) {
+      *best = det;
+      found = true;
+    }
+  }
+  return found;
 }
 
 std::vector<unsigned char> BuildPgmSnapshot(const ssne_tensor_t& img_sensor,
@@ -1065,13 +1380,14 @@ bool RunSerialSetup(UartControlChannel* uart,
                     IMAGEPROCESSOR* processor,
                     const std::array<int, 2>& crop_shape,
                     GuardZone* zone,
-                    VISUALIZER* visualizer) {
+                    VISUALIZER* visualizer,
+                    ArmMode* arm_mode) {
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, zone)) {
     printf("[SETUP] Loaded existing zone: %s\n", zone->Describe().c_str());
   } else {
     printf("[SETUP] No existing zone config found\n");
   }
-  printf("[SETUP] Waiting serial commands: SNAPSHOT | ZONE <json> | START\n");
+  printf("[SETUP] Waiting serial commands: SNAPSHOT | ZONE <json> | MODE HOME/AWAY/SLEEP | START\n");
 
   std::string line;
   while (!check_exit_flag()) {
@@ -1085,6 +1401,15 @@ bool RunSerialSetup(UartControlChannel* uart,
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
       ApplyZoneCommand(uart, line.substr(5), zone, visualizer);
+    } else if (line.rfind("MODE ", 0) == 0) {
+      ArmMode parsed_mode;
+      if (ParseArmMode(line.substr(5), &parsed_mode)) {
+        *arm_mode = parsed_mode;
+        printf("[MODE] %s\n", ArmModeName(*arm_mode));
+        uart->SendTextLine(std::string("OK MODE ") + ArmModeName(*arm_mode));
+      } else {
+        uart->SendTextLine("ERR MODE");
+      }
     } else if (line == "START") {
       uart->SendTextLine("OK START");
       return true;
@@ -1101,7 +1426,8 @@ void PollRuntimeSerial(UartControlChannel* uart,
                        IMAGEPROCESSOR* processor,
                        const std::array<int, 2>& crop_shape,
                        GuardZone* zone,
-                       VISUALIZER* visualizer) {
+                       VISUALIZER* visualizer,
+                       ArmMode* arm_mode) {
   if (uart == nullptr || !uart->IsOpen()) {
     return;
   }
@@ -1115,6 +1441,15 @@ void PollRuntimeSerial(UartControlChannel* uart,
       }
     } else if (line.rfind("ZONE ", 0) == 0) {
       ApplyZoneCommand(uart, line.substr(5), zone, visualizer);
+    } else if (line.rfind("MODE ", 0) == 0) {
+      ArmMode parsed_mode;
+      if (ParseArmMode(line.substr(5), &parsed_mode)) {
+        *arm_mode = parsed_mode;
+        printf("[MODE] %s\n", ArmModeName(*arm_mode));
+        uart->SendTextLine(std::string("OK MODE ") + ArmModeName(*arm_mode));
+      } else {
+        uart->SendTextLine("ERR MODE");
+      }
     } else if (line == "START") {
       uart->SendTextLine("OK START");
     } else if (line == "QUIT") {
@@ -1193,6 +1528,8 @@ int main() {
   SnapshotBuffer      snapshot_buffer;
   RawFrameBuffer      raw_frame_buf;
   GuardZone           active_zone;
+  ArmMode             arm_mode = ArmMode::kAway;
+  AlarmLifecycle      alarm_lifecycle;
   UartControlChannel  uart_channel;
 
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, &active_zone)) {
@@ -1208,7 +1545,8 @@ int main() {
       fprintf(stderr, "[RESOURCE][WARN] UART setup disabled; using existing/default zone\n");
     } else {
       uart_ready = true;
-      if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone, &visualizer)) {
+      if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone,
+                          &visualizer, &arm_mode)) {
         if (check_exit_flag()) {
           uart_channel.Release();
           if (gpio_ready) gpio_alarm.Release();
@@ -1256,6 +1594,7 @@ int main() {
   int infer_fail_count  = 0;
   int data_fail_count   = 0;
   EnvPolicyState env_state;
+  int roi_frame_index = 0;
 
   // 端到端延迟样本环（帧捕获 -> OSD刷新），用于 P95 统计
   std::vector<long long> latency_samples;
@@ -1267,12 +1606,23 @@ int main() {
          kSensorFps,
          det_shape[0],
          det_shape[1]);
-  printf("[CHECK][FEATURE] detect=%s zone=%s osd=ON gpio=%s uart=%s snapshot=MEM%s env=ON exceptions=ON\n",
+  printf("[CHECK][FEATURE] detect=%s zone=%s osd=ON gpio=%s uart=%s snapshot=MEM%s env=ON exceptions=ON mode=%s events=ON selftest=ON\n",
          BoolText(detector_ready),
          active_zone.active ? active_zone.shape.c_str() : "OFF",
          BoolText(gpio_ready),
          BoolText(uart_ready),
-         coco_config::kSaveSnapshotFileInRun ? "+FILE" : "");
+          coco_config::kSaveSnapshotFileInRun ? "+FILE" : "",
+          ArmModeName(arm_mode));
+  printf("[SELFTEST] camera=PENDING model=%s gpio=%s uart=%s osd=%s zone=%s mode=%s health=%s\n",
+         BoolText(detector_ready),
+         BoolText(gpio_ready),
+         BoolText(uart_ready),
+         BoolText(alert_bitmap_ready),
+         active_zone.active ? "READY" : "NOT_CONFIGURED",
+         ArmModeName(arm_mode),
+         detector_ready && gpio_ready && uart_ready && alert_bitmap_ready && active_zone.active
+             ? "READY" : "DEGRADED");
+  bool selftest_camera_reported = false;
   if (accept_stats.resource_warnings > 0) {
     printf("[CHECK][DEGRADE] resource_warnings=%d detector=%s gpio=%s uart=%s alert_bitmap=%s\n",
            accept_stats.resource_warnings,
@@ -1304,6 +1654,18 @@ int main() {
       continue;
     }
     cam_fail_count = 0;
+    if (!selftest_camera_reported) {
+      printf("[SELFTEST] camera=OK model=%s gpio=%s uart=%s osd=%s zone=%s mode=%s health=%s\n",
+             BoolText(detector_ready),
+             BoolText(gpio_ready),
+             BoolText(uart_ready),
+             BoolText(alert_bitmap_ready),
+             active_zone.active ? "READY" : "NOT_CONFIGURED",
+             ArmModeName(arm_mode),
+             detector_ready && gpio_ready && uart_ready && alert_bitmap_ready && active_zone.active
+                 ? "READY" : "DEGRADED");
+      selftest_camera_reported = true;
+    }
 
     // --- [异常类2] 数据异常处理 ---
     // 校验张量数据指针、维度合法性
@@ -1344,7 +1706,8 @@ int main() {
     }
 
     if (uart_ready) {
-      PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone, &visualizer);
+      PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone,
+                        &visualizer, &arm_mode);
     }
 
     ++fps_frame_count;
@@ -1394,6 +1757,34 @@ int main() {
       det_result.Clear();
     }
 
+    // Optional local enhancement: the existing danger zone is the only user
+    // configuration. The full-frame result remains authoritative on failures.
+    ++roi_frame_index;
+    if (detector_ready && roi_frame_index % 5 == 0) {
+      ZoneRoiWindow roi;
+      if (BuildZoneRoi(active_zone, crop_shape, &roi)) {
+        ssne_tensor_t roi_tensor;
+        if (BuildZoneRoiTensor(img_sensor, crop_shape, roi, &roi_tensor)) {
+          CocoDetectionResult roi_result;
+          const std::array<int, 2> roi_shape = {roi.side, roi.side};
+          ++accept_stats.roi_runs;
+          if (detector.Predict(&roi_tensor, &roi_result,
+                               env_state.conf_threshold, &roi_shape)) {
+            MergeRoiDetections(&det_result, roi_result, roi, crop_shape);
+          } else {
+            ++accept_stats.roi_failures;
+            fprintf(stderr, "[ROI][WARN] local inference failed; using full-frame result\n");
+          }
+          release_tensor(roi_tensor);
+        } else {
+          ++accept_stats.roi_failures;
+          fprintf(stderr, "[ROI][WARN] local tensor creation failed; using full-frame result\n");
+        }
+      } else if (active_zone.active) {
+        ++accept_stats.roi_skipped;
+      }
+    }
+
     // 追踪和区域判断都在裁剪坐标系(1440x1080)下完成
     FilterDetectionsByAlarmClasses(&det_result, active_zone);
 
@@ -1403,7 +1794,7 @@ int main() {
     // 判断完后坐标转回1920x1080给OSD显示
     std::vector<std::array<float, 4>> normal_boxes;
     std::vector<std::array<float, 4>> alarm_boxes;
-    ClassifyDetections(stable_crop, active_zone, &normal_boxes, &alarm_boxes);
+    ClassifyDetections(stable_crop, active_zone, arm_mode, &normal_boxes, &alarm_boxes);
     ConvertCropBoxesToOriginal(&normal_boxes);
     ConvertCropBoxesToOriginal(&alarm_boxes);
 
@@ -1411,7 +1802,25 @@ int main() {
     ConvertCropBoxesToOriginal(&stable_display);
 
     const bool has_object       = !stable_crop.detections.empty();
-    const bool is_alarm_active  = !alarm_boxes.empty();
+    const bool raw_alarm_active = !alarm_boxes.empty();
+    CocoDetection best_alarm_detection;
+    const bool has_best_alarm = FindBestAlarmDetection(
+        stable_crop, active_zone, arm_mode, &best_alarm_detection);
+    const bool lifecycle_changed = alarm_lifecycle.Update(
+        raw_alarm_active, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now.time_since_epoch()).count(),
+        has_best_alarm ? &best_alarm_detection : nullptr);
+    const bool is_alarm_active = alarm_lifecycle.active;
+    if (lifecycle_changed && alarm_lifecycle.active) {
+      AppendAlarmEvent("START", has_best_alarm ? &best_alarm_detection : nullptr, 0);
+    } else if (lifecycle_changed && !alarm_lifecycle.active) {
+      const long long duration_ms =
+          std::max(0LL, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now.time_since_epoch()).count() - alarm_lifecycle.started_ms);
+      AppendAlarmEvent("END", alarm_lifecycle.has_detection
+                                  ? &alarm_lifecycle.last_detection : nullptr,
+                       duration_ms);
+    }
     if (has_object) {
       ++accept_stats.detection_frames;
       accept_stats.detections += static_cast<int>(stable_crop.detections.size());
@@ -1510,16 +1919,22 @@ int main() {
                p95,
                ToFramePeriods(p95, kSensorFps),
                EstimateLatencyScore(p95, kSensorFps));
-        printf("[CHECK][COUNTS] det_frames=%d alarm_frames=%d detections=%d alarm_detections=%d cam_recoveries=%d data_recoveries=%d infer_failures=%d resource_warnings=%d env_policy=%s\n",
+        printf("[CHECK][COUNTS] det_frames=%d alarm_frames=%d detections=%d alarm_detections=%d alarm_starts=%d alarm_ends=%d cam_recoveries=%d data_recoveries=%d infer_failures=%d resource_warnings=%d roi_runs=%d roi_failures=%d roi_skipped=%d env_policy=%s mode=%s\n",
                accept_stats.detection_frames,
                accept_stats.alarm_frames,
                accept_stats.detections,
                accept_stats.alarm_detections,
+               alarm_lifecycle.starts,
+               alarm_lifecycle.ends,
                accept_stats.camera_recoveries,
                accept_stats.data_recoveries,
                accept_stats.infer_failures,
                accept_stats.resource_warnings,
-               EnvPolicyName(env_state.policy));
+               accept_stats.roi_runs,
+               accept_stats.roi_failures,
+               accept_stats.roi_skipped,
+               EnvPolicyName(env_state.policy),
+               ArmModeName(arm_mode));
         accept_stats.summary_printed = true;
       }
     }

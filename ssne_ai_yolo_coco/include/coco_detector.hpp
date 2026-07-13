@@ -18,7 +18,8 @@ class COCO_DETECTOR {
 
   bool Predict(ssne_tensor_t* img_in,
                CocoDetectionResult* result,
-               float conf_threshold = coco_config::kConfThreshold);
+               float conf_threshold = coco_config::kConfThreshold,
+               const std::array<int, 2>* coordinate_shape = nullptr);
 
   void Release();
 

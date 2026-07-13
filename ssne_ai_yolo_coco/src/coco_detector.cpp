@@ -164,18 +164,37 @@ void COCO_DETECTOR::ApplyNms(std::vector<CocoDetection>* detections) const {
 
 bool COCO_DETECTOR::Predict(ssne_tensor_t* img_in,
                              CocoDetectionResult* result,
-                             float conf_threshold) {
+                             float conf_threshold,
+                             const std::array<int, 2>* coordinate_shape) {
+  const std::array<int, 2> previous_img_shape = img_shape;
+  const float previous_w_scale = w_scale;
+  const float previous_h_scale = h_scale;
+  if (coordinate_shape != nullptr &&
+      (*coordinate_shape)[0] > 0 && (*coordinate_shape)[1] > 0) {
+    img_shape = *coordinate_shape;
+    w_scale = static_cast<float>(img_shape[0]) / static_cast<float>(det_shape[0]);
+    h_scale = static_cast<float>(img_shape[1]) / static_cast<float>(det_shape[1]);
+  }
+
+  const auto restore_shape = [&]() {
+    img_shape = previous_img_shape;
+    w_scale = previous_w_scale;
+    h_scale = previous_h_scale;
+  };
+
   result->Clear();
 
   const int preproc_ret = RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0]);
   if (preproc_ret != 0) {
     fprintf(stderr, "[INFER][ALARM] Preprocess pipe failed, code=%d\n", preproc_ret);
+    restore_shape();
     return false;
   }
 
   const int infer_ret = ssne_inference(model_id, 1, inputs);
   if (infer_ret != 0) {
     fprintf(stderr, "[INFER][ALARM] ssne_inference failed, code=%d\n", infer_ret);
+    restore_shape();
     return false;
   }
 
@@ -198,6 +217,7 @@ bool COCO_DETECTOR::Predict(ssne_tensor_t* img_in,
 
   ApplyNms(&detections);
   result->detections = detections;
+  restore_shape();
   return true;
 }
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import socket
 import sys
@@ -114,6 +115,7 @@ class ControllerConfig:
     auto_exit_after_send: bool = True
     auto_refresh_snapshot: bool = True
     alarm_classes: list[str] | str | None = None
+    arm_mode: str = "AWAY"
     snapshot_refresh_interval_ms: int = 500
     startup_retry: int = 5
     startup_retry_interval: float = 1.0
@@ -165,6 +167,9 @@ def load_controller_config(config_path: Path) -> ControllerConfig:
     config.auto_exit_after_send = bool(config.auto_exit_after_send)
     config.auto_refresh_snapshot = bool(config.auto_refresh_snapshot)
     config.alarm_classes = normalize_alarm_classes(config.alarm_classes)
+    config.arm_mode = str(config.arm_mode).strip().upper()
+    if config.arm_mode not in {"HOME", "AWAY", "SLEEP"}:
+        raise ValueError("arm_mode只能是HOME、AWAY或SLEEP")
     config.snapshot_source = str(config.snapshot_source).strip().lower()
     config.snapshot_url = str(config.snapshot_url)
     config.snapshot_file = str(config.snapshot_file)
@@ -228,6 +233,8 @@ def merge_args_into_config(config: ControllerConfig, args: argparse.Namespace) -
         config.auto_refresh_snapshot = args.auto_refresh_snapshot
     if args.alarm_classes is not None:
         config.alarm_classes = normalize_alarm_classes(args.alarm_classes)
+    if args.arm_mode is not None:
+        config.arm_mode = args.arm_mode
     if args.snapshot_refresh_interval_ms is not None:
         config.snapshot_refresh_interval_ms = max(args.snapshot_refresh_interval_ms, 100)
     if args.startup_retry is not None:
@@ -254,6 +261,9 @@ def resolve_config_path(raw_path: str, config_dir: Path) -> Path:
 
 class ZoneSender(Protocol):
     def display_target(self) -> str:
+        ...
+
+    def set_mode(self, mode: str) -> None:
         ...
 
     def send(self, zone: Zone) -> str | None:
@@ -329,6 +339,7 @@ class SerialControlClient:
         ack_timeout_sec: float = 2.0,
         command_retries: int = 3,
         require_ack: bool = True,
+        arm_mode: str = "AWAY",
     ) -> None:
         if serial is None:
             raise RuntimeError("缺少 pyserial，请先执行: pip install pyserial")
@@ -341,6 +352,7 @@ class SerialControlClient:
         self.ack_timeout_sec = max(float(ack_timeout_sec), 0.1)
         self.command_retries = max(int(command_retries), 1)
         self.require_ack = bool(require_ack)
+        self.arm_mode = arm_mode
 
     def fetch(self) -> SnapshotFrame:
         with self._open_serial() as ser:
@@ -381,6 +393,7 @@ class SerialControlClient:
                     b"ERR ZONE",
                     "ZONE",
                 ),
+                (f"MODE {self.arm_mode}\n".encode("ascii"), b"OK MODE", b"ERR CMD", "MODE"),
                 (b"START\n", b"OK START", b"ERR CMD", "START"),
             )
             if self.require_ack:
@@ -398,6 +411,19 @@ class SerialControlClient:
                 if warning:
                     warnings.append(warning)
             return "; ".join(warnings) or None
+
+    def set_mode(self, mode: str) -> None:
+        mode = mode.strip().upper()
+        if mode not in {"HOME", "AWAY", "SLEEP"}:
+            raise ValueError(f"不支持的布防模式: {mode}")
+        with self._open_serial() as ser:
+            ser.reset_input_buffer()
+            command = f"MODE {mode}\n".encode("ascii")
+            if self.require_ack:
+                self._send_command_with_ack(ser, command, b"OK MODE", b"ERR CMD", "MODE")
+            else:
+                self._send_command_best_effort(ser, command, b"OK MODE", b"ERR CMD", "MODE")
+        self.arm_mode = mode
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -629,6 +655,7 @@ class ZoneDrawerApp:
         auto_exit_after_send: bool,
         auto_refresh_snapshot: bool,
         alarm_classes: list[str],
+        arm_mode: str,
         snapshot_refresh_interval_ms: int,
         startup_retry: int,
         startup_retry_interval_sec: float,
@@ -643,6 +670,7 @@ class ZoneDrawerApp:
         self.auto_exit_after_send = auto_exit_after_send
         self.auto_refresh_snapshot = auto_refresh_snapshot
         self.alarm_classes = list(alarm_classes)
+        self.arm_mode = arm_mode
         self.snapshot_refresh_interval_ms = snapshot_refresh_interval_ms
         self.startup_retry = startup_retry
         self.startup_retry_interval_sec = startup_retry_interval_sec
@@ -691,10 +719,23 @@ class ZoneDrawerApp:
             if self.zone_file.exists():
                 self.zone_file.unlink()
             return
-        self.zone_file.write_text(
-            json.dumps(zone.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+
+        self.zone_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.zone_file.with_name(
+            f".{self.zone_file.name}.{os.getpid()}.tmp"
         )
+        payload = json.dumps(zone.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        try:
+            with temp_path.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.zone_file)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _make_blank(self) -> np.ndarray:
         blank = np.full((720, 1280, 3), 25, dtype=np.uint8)
@@ -947,9 +988,17 @@ class ZoneDrawerApp:
             return
 
         if self.pending_zone is not None:
-            self.current_zone = self.pending_zone
+            pending_zone = self.pending_zone
+            try:
+                self._save_zone(pending_zone)
+            except OSError as exc:
+                self.last_status = (
+                    "Board zone updated, but local zone save failed: "
+                    f"{exc}; press S to retry local save"
+                )
+                return
+            self.current_zone = pending_zone
             self.pending_zone = None
-            self._save_zone(self.current_zone)
 
         self.last_status = (
             f"Sent to board {self.sender.display_target()} -> "
@@ -1042,6 +1091,15 @@ class ZoneDrawerApp:
                     self._clear_zone()
                 elif key in (ord("z"), ord("Z"), 8):
                     self._undo_point()
+                elif key in (ord("m"), ord("M")):
+                    modes = ("HOME", "AWAY", "SLEEP")
+                    next_mode = modes[(modes.index(self.arm_mode) + 1) % len(modes)]
+                    try:
+                        self.sender.set_mode(next_mode)
+                        self.arm_mode = next_mode
+                        self.last_status = f"Arm mode set: {self.arm_mode}"
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self.last_status = f"Mode change failed: {exc}"
         finally:
             self._bg_stop.set()
 
@@ -1170,6 +1228,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="告警类别白名单，逗号分隔，例如 person,dog,cat",
     )
     parser.add_argument(
+        "--arm-mode",
+        choices=("HOME", "AWAY", "SLEEP"),
+        default=None,
+        help="布防模式：HOME、AWAY或SLEEP",
+    )
+    parser.add_argument(
         "--snapshot-refresh-interval-ms",
         type=int,
         default=None,
@@ -1255,6 +1319,7 @@ def main() -> int:
                 ack_timeout_sec=config.serial_ack_timeout_sec,
                 command_retries=config.serial_command_retries,
                 require_ack=config.serial_require_ack,
+                arm_mode=config.arm_mode,
             )
             snapshot_client = serial_client
             sender = serial_client
@@ -1267,6 +1332,7 @@ def main() -> int:
         auto_exit_after_send=config.auto_exit_after_send,
         auto_refresh_snapshot=config.auto_refresh_snapshot,
         alarm_classes=config.alarm_classes,
+        arm_mode=config.arm_mode,
         snapshot_refresh_interval_ms=config.snapshot_refresh_interval_ms,
         startup_retry=config.startup_retry,
         startup_retry_interval_sec=config.startup_retry_interval,

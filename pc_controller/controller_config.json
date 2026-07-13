@@ -19,6 +19,7 @@
   "auto_exit_after_send": false,
   "auto_refresh_snapshot": false,
   "alarm_classes": ["person", "dog", "cat"],
+  "arm_mode": "AWAY",
   "snapshot_refresh_interval_ms": 500,
   "startup_retry": 5,
   "startup_retry_interval": 1.0,

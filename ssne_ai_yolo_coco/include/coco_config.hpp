@@ -22,6 +22,8 @@ static const char* kSnapshotRoute         = "/?action=snapshot";
 static const char* kSnapshotAltRoute      = "/latest_snapshot.pgm";
 static const char* kSnapshotFilePath      = "/app_demo/latest_snapshot.pgm";
 static const char* kZoneConfigPath        = "/app_demo/zone_config.json";
+static const char* kAlarmEventLogPath     = "/app_demo/alarm_events.log";
+static const int   kAlarmEventMaxBytes    = 65536;
 static const int   kSerialPreviewWidth    = 128;
 static const int   kSerialPreviewHeight   = 96;
 static const bool  kEnableSerialSetup     = true;
@@ -44,6 +46,7 @@ static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 0;
 static const int   kAlarmHoldMs     = 0;      // 检测丢失立即停止报警
 static const int   kLowLightAlarmHoldMs = 0;
+static const int   kAlarmEventClearMs = 1500;
 static const int   kEnvLowLightY     = 40;
 static const int   kEnvBrightY       = 210;
 static const int   kEnvPolicyStableSamples = 3;

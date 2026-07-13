@@ -82,9 +82,9 @@ pip install -r requirements.txt
 
 ```json
 {
-  "snapshot_source": "serial",
   "serial_port": "COM6",
   "serial_baudrate": 115200,
+  "arm_mode": "AWAY",
   "alarm_classes": ["person", "dog", "cat"]
 }
 ```
@@ -104,17 +104,16 @@ run.bat
 | `C` | 清除危险区 |
 | `N` | 重新请求一张快照 |
 | `S` | 发送危险区到板端 |
+| `M` | 循环切换HOME / AWAY / SLEEP布防模式 |
 | `Q` / Esc | 退出 |
 
 ## 工作模式
 
-`snapshot_source` 支持三种：
-
-- `serial`：推荐；无网络时可用，配合 `SNAPSHOT`、`ZONE`、`START` 串口命令。
-- `http`：板端 HTTP 快照服务可用时使用。
-- `file`：离线读取本地 `latest_snapshot.pgm`。
+当前PC控制器固定使用串口模式：通过UART获取快照，并通过UART发送`ZONE`和`START`命令。
 
 当前版本的自动刷新已移入后台线程，避免快照请求阻塞窗口交互。绘制过程中会暂停自动刷新，防止区域点位漂移。
+
+板端会根据已发送的危险区自动决定是否启用远端局部增强。危险区面积超过裁剪画面的80%时跳过ROI补充推理；其他情况下无需用户额外标记远端区域。ROI只用于补充检测，最终报警仍使用原始多边形判断，ROI失败会回退到全图结果。
 
 ## 坐标与显示约定
 
@@ -129,6 +128,7 @@ run.bat
 ```text
 SNAPSHOT
 ZONE <json>
+MODE HOME|AWAY|SLEEP
 START
 ```
 

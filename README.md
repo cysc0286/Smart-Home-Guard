@@ -6,6 +6,7 @@ HALO (Home Alert & Location Observer) 是基于飞凌微 A1 开发套件和思�
 
 - 端侧检测：使用 256x256 输入的 `smart_guard_coco_256.m1model`，保留 person、dog、cat 三类告警目标。
 - 危险区配置：PC 上位机通过串口获取 Aurora 当前画面快照，绘制危险区后发送到板端。
+- 远端增强：危险区面积不超过裁剪画面的80%时，板端自动从现有危险区生成局部方形ROI，按固定256x256输入做间隔补充推理；ROI异常时自动回退到全图检测，不增加用户初始化配置。
 - 区域判断：矩形和多边形危险区均支持；多边形判断使用真实点集的 point-in-polygon 算法。
 - OSD 展示：检测框、危险区、ALERT 图标分图层显示。当前正式演示中，多边形危险区的 OSD 显示为外接矩形，便于控制 OSD buffer 和现场稳定性；告警判断仍按真实多边形完成。
 - 声光报警：目标进入危险区时触发 GPIO LED/蜂鸣器。
@@ -16,7 +17,7 @@ HALO (Home Alert & Location Observer) 是基于飞凌微 A1 开发套件和思�
 
 ```text
 ssne_ai_yolo_coco/      板端 C++ 主程序、检测器、OSD、GPIO、UART 和启动脚本
-pc_controller/          PC 上位机危险区绘制与串口/TCP 配置工具
+pc_controller/          PC 上位机危险区绘制与串口配置工具
 model/                  模型导出、训练辅助脚本和数据处理工具
 tools/                  辅助资源生成脚本
 submission_materials/   作品 PPT、技术文档等提交材料草稿
