@@ -369,17 +369,23 @@ void VISUALIZER::ClearZoneOverlay() {
     osd_device.ClearLayer(ZONE_BITMAP_LAYER_ID);
 }
 
-void VISUALIZER::ShowAlarmIndicator(int pos_x, int pos_y) {
-    if (m_alarm_indicator_visible) return;
-    const std::string path = "/app_demo/app_assets/" + std::string(coco_config::kAlarmBitmapName);
-    m_alarm_indicator_visible =
-        osd_device.DrawTexture(path.c_str(), nullptr, ALARM_LAYER_ID, pos_x, pos_y);
+bool VISUALIZER::ShowStatusCard(const std::string& bitmap_name, int pos_x, int pos_y) {
+    if (bitmap_name == m_status_bitmap_name) return true;
+
+    const std::string path = "/app_demo/app_assets/" + bitmap_name;
+    osd_device.ClearLayer(STATUS_LAYER_ID);
+    if (!osd_device.DrawTexture(path.c_str(), nullptr, STATUS_LAYER_ID, pos_x, pos_y)) {
+        m_status_bitmap_name.clear();
+        return false;
+    }
+    m_status_bitmap_name = bitmap_name;
+    return true;
 }
 
-void VISUALIZER::HideAlarmIndicator() {
-    if (!m_alarm_indicator_visible) return;
-    osd_device.ClearLayer(ALARM_LAYER_ID);
-    m_alarm_indicator_visible = false;
+void VISUALIZER::ClearStatusCard() {
+    if (m_status_bitmap_name.empty()) return;
+    osd_device.ClearLayer(STATUS_LAYER_ID);
+    m_status_bitmap_name.clear();
 }
 
 void VISUALIZER::DrawFixedSquare(int x_min, int y_min, int x_max, int y_max, int layer_id) {

@@ -162,6 +162,22 @@ void GpioAlarmController::Update(bool has_object, int hold_ms, GpioAlarmMode mod
   SetBuzzer(buzzer_on_);
 }
 
+void GpioAlarmController::Reset() {
+  if (!initialized_) {
+    return;
+  }
+
+  SetLed(false);
+  SetBuzzer(false);
+  buzzer_on_ = false;
+  last_object_seen_ms_ = 0;
+  const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+  last_toggle_ms_ = now_ms;
+  last_update_call_ms_ = now_ms;
+}
+
 void GpioAlarmController::Release() {
   if (!initialized_) {
     return;

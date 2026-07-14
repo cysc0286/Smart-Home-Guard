@@ -17,6 +17,7 @@ class GpioAlarmController {
   void Update(bool has_object);
   void Update(bool has_object, int hold_ms);
   void Update(bool has_object, int hold_ms, GpioAlarmMode mode);
+  void Reset();
   void Release();
 
  private:

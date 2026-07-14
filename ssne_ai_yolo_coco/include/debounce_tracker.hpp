@@ -118,6 +118,13 @@ class DebounceTracker {
     return result;
   }
 
+  // A mode change starts a new protection session.  Discarding the previous
+  // tracks prevents a detection confirmed under one policy from immediately
+  // triggering another policy without passing the normal confirmation time.
+  void Reset() {
+    tracks_.clear();
+  }
+
  private:
   static constexpr float kIoUThreshold = 0.3f;
   static constexpr float kSmoothing    = 0.4f;   // EMA平滑系数

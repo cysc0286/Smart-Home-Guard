@@ -100,8 +100,8 @@ void OsdDevice::Initialize(int width, int height, const char* bitmap_lut_path){
         }
     }
 
-    // Layer 2/3: 多边形危险区域位图 + ALERT位图 (RLE编码)。
-    // 多边形层先创建，确保位图资源不足时危险区轮廓优先于ALERT图标。
+    // Layer 2/3: 多边形危险区域位图 + 事件状态卡 (RLE编码)。
+    // 多边形层先创建，确保位图资源不足时危险区轮廓优先于状态卡。
     for (int layer_index = 2; layer_index < OSD_LAYER_SIZE; ++layer_index) {
         // 多边形可能覆盖较大画面，预留更大的RLE编码缓冲区。
         const int dma_size = (layer_index == 2) ? 0x40000 : 0x20000;

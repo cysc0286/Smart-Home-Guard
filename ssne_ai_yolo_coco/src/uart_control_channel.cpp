@@ -48,7 +48,18 @@ bool UartControlChannel::IsOpen() const {
 bool UartControlChannel::SendTextLine(const std::string& line) {
   std::string payload = line;
   payload.push_back('\n');
-  return SendBytes(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+  if (!SendBytes(reinterpret_cast<const uint8_t*>(payload.data()), payload.size())) {
+    return false;
+  }
+
+  // The A1 UART API is backed by a 32-byte TX FIFO.  A final short write can
+  // remain pending until another FIFO write is submitted.  ACK lines are all
+  // shorter than one FIFO, so without this transport-only padding the board
+  // can apply ZONE/MODE but the host never receives the matching OK line.
+  // Keep the padding outside the text protocol; the host marker scanner
+  // ignores it and clears the input buffer before the next transaction.
+  const uint8_t transport_flush[kFifoBytes * 2] = {0};
+  return SendBytes(transport_flush, sizeof(transport_flush));
 }
 
 bool UartControlChannel::SendBytes(const uint8_t* data, size_t len) {
@@ -60,7 +71,12 @@ bool UartControlChannel::SendBytes(const uint8_t* data, size_t len) {
   while (offset < len) {
     const uint32_t chunk = static_cast<uint32_t>(
         std::min<size_t>(len - offset, static_cast<size_t>(kFifoBytes)));
-    uart_send_data(handle_, UART_TX0, const_cast<uint8_t*>(data + offset), chunk);
+    if (uart_send_data(handle_, UART_TX0,
+                       const_cast<uint8_t*>(data + offset), chunk) != UART_SUCCESS) {
+      fprintf(stderr, "[UART] Failed to send %u-byte chunk at offset %zu/%zu\n",
+              chunk, offset, len);
+      return false;
+    }
     offset += chunk;
     usleep(kTxChunkGapUs);
   }

@@ -65,10 +65,16 @@ static const int   kColorZoneBox    = 3;   // Yellow - danger zone outline
 static const int   kZoneBorderPx    = 5;   // 危险区域黄框线宽
 static const int   kBoxBorderPx     = 5;   // 检测框线宽：3 -> 5，大框轮廓更醒目
 
-// 报警位图（ALERT字样），触发时显示在左上角
-static const char* kAlarmBitmapName = "alert.ssbmp";
-static const int   kAlarmBitmapPosX = 30;
-static const int   kAlarmBitmapPosY = 30;
+// 事件驱动状态卡，显示在左上角；位图由 tools/gen_status_ssbmp.py 预生成。
+static const char* kStatusHomeBitmapName     = "status_home.ssbmp";
+static const char* kStatusAwayBitmapName     = "status_away.ssbmp";
+static const char* kStatusSleepBitmapName    = "status_sleep.ssbmp";
+static const char* kStatusConfigBitmapName   = "status_config.ssbmp";
+static const char* kStatusNoZoneBitmapName   = "status_no_zone.ssbmp";
+static const char* kStatusAlarmBitmapName    = "status_alarm.ssbmp";
+static const char* kStatusDegradedBitmapName = "status_degraded.ssbmp";
+static const int   kStatusBitmapPosX = 30;
+static const int   kStatusBitmapPosY = 30;
 
 static const std::array<int, 3> kStrides = {8, 16, 32};
 

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
@@ -237,12 +238,14 @@ enum class ArmMode {
   kHome,
   kAway,
   kSleep,
+  kConfig,
 };
 
 const char* ArmModeName(ArmMode mode) {
   switch (mode) {
     case ArmMode::kAway: return "AWAY";
     case ArmMode::kSleep: return "SLEEP";
+    case ArmMode::kConfig: return "CONFIG";
     case ArmMode::kHome:
     default: return "HOME";
   }
@@ -262,20 +265,26 @@ bool ParseArmMode(const std::string& text, ArmMode* mode) {
     *mode = ArmMode::kSleep;
     return true;
   }
+  if (text == "CONFIG" || text == "OFF") {
+    *mode = ArmMode::kConfig;
+    return true;
+  }
   return false;
 }
 
 bool ModeAllowsAlarmClass(int class_id, ArmMode mode) {
-  // HOME and SLEEP are human-safety modes: a person entering the danger zone
-  // is the primary risk. AWAY is unattended protection and includes all
-  // configured alarm classes, including pets.
-  return mode == ArmMode::kAway || class_id == 0;
+  // HOME protects family members and pets. AWAY/SLEEP focus on human entry.
+  // CONFIG keeps detection/OSD running while all alarm outputs are disarmed.
+  if (mode == ArmMode::kConfig) return false;
+  if (mode == ArmMode::kHome) return true;
+  return class_id == 0;
 }
 
 GpioAlarmMode GpioModeForArmMode(ArmMode mode) {
   switch (mode) {
     case ArmMode::kAway: return GpioAlarmMode::kAway;
     case ArmMode::kSleep: return GpioAlarmMode::kSleep;
+    case ArmMode::kConfig:
     case ArmMode::kHome:
     default: return GpioAlarmMode::kHome;
   }
@@ -314,7 +323,28 @@ struct AlarmLifecycle {
     }
     return false;
   }
+
+  void ResetActiveState() {
+    active = false;
+    last_raw_active_ms = 0;
+    started_ms = 0;
+    has_detection = false;
+  }
 };
+
+const char* StatusBitmapName(ArmMode mode, bool zone_active,
+                             bool alarm_active, bool degraded) {
+  if (alarm_active) return coco_config::kStatusAlarmBitmapName;
+  if (degraded) return coco_config::kStatusDegradedBitmapName;
+  if (!zone_active) return coco_config::kStatusNoZoneBitmapName;
+  switch (mode) {
+    case ArmMode::kAway: return coco_config::kStatusAwayBitmapName;
+    case ArmMode::kSleep: return coco_config::kStatusSleepBitmapName;
+    case ArmMode::kConfig: return coco_config::kStatusConfigBitmapName;
+    case ArmMode::kHome:
+    default: return coco_config::kStatusHomeBitmapName;
+  }
+}
 
 std::string WallClockText() {
   const std::time_t now = std::time(nullptr);
@@ -357,6 +387,33 @@ void AppendAlarmEvent(const char* event_name,
   output.close();
   printf("[EVENT] %s class=%s score=%.2f duration_ms=%lld\n",
          event_name, class_name, score, duration_ms);
+}
+
+void ApplyArmMode(ArmMode next_mode, ArmMode* arm_mode,
+                  DebounceTracker* tracker, AlarmLifecycle* alarm_lifecycle,
+                  GpioAlarmController* gpio_alarm, bool gpio_ready) {
+  if (arm_mode == nullptr || tracker == nullptr || alarm_lifecycle == nullptr ||
+      *arm_mode == next_mode) {
+    return;
+  }
+
+  const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (alarm_lifecycle->active) {
+    const long long duration_ms = std::max(0LL, now_ms - alarm_lifecycle->started_ms);
+    AppendAlarmEvent("END_MODE_CHANGE",
+                     alarm_lifecycle->has_detection
+                         ? &alarm_lifecycle->last_detection : nullptr,
+                     duration_ms);
+    ++alarm_lifecycle->ends;
+  }
+
+  tracker->Reset();
+  alarm_lifecycle->ResetActiveState();
+  if (gpio_ready && gpio_alarm != nullptr) gpio_alarm->Reset();
+  *arm_mode = next_mode;
+  printf("[MODE] %s policy_reset=1 confirm_ms=%d\n",
+         ArmModeName(*arm_mode), coco_config::kAlarmConfirmMs);
 }
 
 class SnapshotHttpServer {
@@ -1421,8 +1478,16 @@ bool SendSerialSnapshot(UartControlChannel* uart,
                        std::to_string(crop_shape[0]) + " " +
                        std::to_string(crop_shape[1]) + " " +
                        std::to_string(preview.size()) + "\n";
+
+  // The UART API is backed by a 32-byte TX FIFO.  On the final short write,
+  // part of the FIFO can remain pending until another write is submitted.
+  // Keep these transport-only bytes outside the payload size advertised in
+  // the header: they flush the complete QOI tail onto the wire, while the PC
+  // reads exactly preview.size() bytes and then drains this padding.
+  const std::array<uint8_t, 64> transport_flush = {{0}};
   return uart->SendBytes(reinterpret_cast<const uint8_t*>(header.data()), header.size()) &&
-         uart->SendBytes(preview.data(), preview.size());
+         uart->SendBytes(preview.data(), preview.size()) &&
+         uart->SendBytes(transport_flush.data(), transport_flush.size());
 }
 
 bool RunSerialSetup(UartControlChannel* uart,
@@ -1430,13 +1495,17 @@ bool RunSerialSetup(UartControlChannel* uart,
                     const std::array<int, 2>& crop_shape,
                     GuardZone* zone,
                     VISUALIZER* visualizer,
-                    ArmMode* arm_mode) {
+                    ArmMode* arm_mode,
+                    DebounceTracker* tracker,
+                    AlarmLifecycle* alarm_lifecycle,
+                    GpioAlarmController* gpio_alarm,
+                    bool gpio_ready) {
   if (LoadZoneFromFile(coco_config::kZoneConfigPath, zone)) {
     printf("[SETUP] Loaded existing zone: %s\n", zone->Describe().c_str());
   } else {
     printf("[SETUP] No existing zone config found\n");
   }
-  printf("[SETUP] Waiting serial commands: SNAPSHOT | ZONE <json> | MODE HOME/AWAY/SLEEP | START\n");
+  printf("[SETUP] Waiting serial commands: SNAPSHOT | ZONE <json> | MODE HOME/AWAY/SLEEP/CONFIG | START\n");
 
   std::string line;
   while (!check_exit_flag()) {
@@ -1453,8 +1522,8 @@ bool RunSerialSetup(UartControlChannel* uart,
     } else if (line.rfind("MODE ", 0) == 0) {
       ArmMode parsed_mode;
       if (ParseArmMode(line.substr(5), &parsed_mode)) {
-        *arm_mode = parsed_mode;
-        printf("[MODE] %s\n", ArmModeName(*arm_mode));
+        ApplyArmMode(parsed_mode, arm_mode, tracker, alarm_lifecycle,
+                     gpio_alarm, gpio_ready);
         uart->SendTextLine(std::string("OK MODE ") + ArmModeName(*arm_mode));
       } else {
         uart->SendTextLine("ERR MODE");
@@ -1476,7 +1545,11 @@ void PollRuntimeSerial(UartControlChannel* uart,
                        const std::array<int, 2>& crop_shape,
                        GuardZone* zone,
                        VISUALIZER* visualizer,
-                       ArmMode* arm_mode) {
+                       ArmMode* arm_mode,
+                       DebounceTracker* tracker,
+                       AlarmLifecycle* alarm_lifecycle,
+                       GpioAlarmController* gpio_alarm,
+                       bool gpio_ready) {
   if (uart == nullptr || !uart->IsOpen()) {
     return;
   }
@@ -1493,8 +1566,8 @@ void PollRuntimeSerial(UartControlChannel* uart,
     } else if (line.rfind("MODE ", 0) == 0) {
       ArmMode parsed_mode;
       if (ParseArmMode(line.substr(5), &parsed_mode)) {
-        *arm_mode = parsed_mode;
-        printf("[MODE] %s\n", ArmModeName(*arm_mode));
+        ApplyArmMode(parsed_mode, arm_mode, tracker, alarm_lifecycle,
+                     gpio_alarm, gpio_ready);
         uart->SendTextLine(std::string("OK MODE ") + ArmModeName(*arm_mode));
       } else {
         uart->SendTextLine("ERR MODE");
@@ -1550,13 +1623,23 @@ int main() {
   // 切换到 colorLUT.sscl（21 RGB 条目）以支持白/红/黄三色 OSD 显示
   visualizer.Initialize(img_shape, "colorLUT.sscl");
 
-  const std::string alert_bitmap_path =
-      "/app_demo/app_assets/" + std::string(coco_config::kAlarmBitmapName);
-  const bool alert_bitmap_ready = FileReadable(alert_bitmap_path);
-  if (!alert_bitmap_ready) {
-    ++accept_stats.resource_warnings;
-    fprintf(stderr, "[RESOURCE][WARN] alert bitmap missing: %s; bitmap alarm disabled\n",
-            alert_bitmap_path.c_str());
+  const char* const status_bitmap_names[] = {
+      coco_config::kStatusHomeBitmapName,
+      coco_config::kStatusAwayBitmapName,
+      coco_config::kStatusSleepBitmapName,
+      coco_config::kStatusConfigBitmapName,
+      coco_config::kStatusNoZoneBitmapName,
+      coco_config::kStatusAlarmBitmapName,
+      coco_config::kStatusDegradedBitmapName,
+  };
+  bool status_bitmaps_ready = true;
+  for (size_t i = 0; i < sizeof(status_bitmap_names) / sizeof(status_bitmap_names[0]); ++i) {
+    const std::string path = "/app_demo/app_assets/" + std::string(status_bitmap_names[i]);
+    if (!FileReadable(path)) {
+      status_bitmaps_ready = false;
+      ++accept_stats.resource_warnings;
+      fprintf(stderr, "[RESOURCE][WARN] status bitmap missing: %s\n", path.c_str());
+    }
   }
 
   GpioAlarmController gpio_alarm;
@@ -1595,7 +1678,8 @@ int main() {
     } else {
       uart_ready = true;
       if (!RunSerialSetup(&uart_channel, &processor, crop_shape, &active_zone,
-                          &visualizer, &arm_mode)) {
+                          &visualizer, &arm_mode, &tracker, &alarm_lifecycle,
+                          &gpio_alarm, gpio_ready)) {
         if (check_exit_flag()) {
           uart_channel.Release();
           if (gpio_ready) gpio_alarm.Release();
@@ -1616,6 +1700,13 @@ int main() {
 
   // 启动后立即把已加载的 zone 绘制为黄色框
   RefreshZoneOverlay(&visualizer, active_zone);
+
+  const bool static_degraded = !detector_ready || !gpio_ready || !uart_ready;
+  if (status_bitmaps_ready) {
+    visualizer.ShowStatusCard(
+        StatusBitmapName(arm_mode, active_zone.active, false, static_degraded),
+        coco_config::kStatusBitmapPosX, coco_config::kStatusBitmapPosY);
+  }
 
   std::thread listener_thread(keyboard_listener);
   SnapshotHttpServer snapshot_server(coco_config::kSnapshotHttpPort, &snapshot_buffer);
@@ -1671,19 +1762,19 @@ int main() {
          BoolText(detector_ready),
          BoolText(gpio_ready),
          BoolText(uart_ready),
-         BoolText(alert_bitmap_ready),
+         BoolText(status_bitmaps_ready),
          active_zone.active ? "READY" : "NOT_CONFIGURED",
          ArmModeName(arm_mode),
-         detector_ready && gpio_ready && uart_ready && alert_bitmap_ready && active_zone.active
+         detector_ready && gpio_ready && uart_ready && status_bitmaps_ready && active_zone.active
              ? "READY" : "DEGRADED");
   bool selftest_camera_reported = false;
   if (accept_stats.resource_warnings > 0) {
-    printf("[CHECK][DEGRADE] resource_warnings=%d detector=%s gpio=%s uart=%s alert_bitmap=%s\n",
+    printf("[CHECK][DEGRADE] resource_warnings=%d detector=%s gpio=%s uart=%s status_bitmaps=%s\n",
            accept_stats.resource_warnings,
            BoolText(detector_ready),
            BoolText(gpio_ready),
            BoolText(uart_ready),
-           BoolText(alert_bitmap_ready));
+           BoolText(status_bitmaps_ready));
   }
 
   while (!check_exit_flag()) {
@@ -1713,10 +1804,10 @@ int main() {
              BoolText(detector_ready),
              BoolText(gpio_ready),
              BoolText(uart_ready),
-             BoolText(alert_bitmap_ready),
+             BoolText(status_bitmaps_ready),
              active_zone.active ? "READY" : "NOT_CONFIGURED",
              ArmModeName(arm_mode),
-             detector_ready && gpio_ready && uart_ready && alert_bitmap_ready && active_zone.active
+             detector_ready && gpio_ready && uart_ready && status_bitmaps_ready && active_zone.active
                  ? "READY" : "DEGRADED");
       selftest_camera_reported = true;
     }
@@ -1761,7 +1852,8 @@ int main() {
 
     if (uart_ready) {
       PollRuntimeSerial(&uart_channel, &processor, crop_shape, &active_zone,
-                        &visualizer, &arm_mode);
+                        &visualizer, &arm_mode, &tracker, &alarm_lifecycle,
+                        &gpio_alarm, gpio_ready);
     }
 
     ++fps_frame_count;
@@ -1926,11 +2018,12 @@ int main() {
                         GpioModeForArmMode(arm_mode));
     }
 
-    // 显示/隐藏英文 ALERT 报警位图
-    if (is_alarm_active && alert_bitmap_ready) {
-      visualizer.ShowAlarmIndicator(coco_config::kAlarmBitmapPosX, coco_config::kAlarmBitmapPosY);
-    } else {
-      visualizer.HideAlarmIndicator();
+    // 状态卡按事件变化切换；相同位图命中缓存，不产生逐帧 OSD 写入。
+    if (status_bitmaps_ready) {
+      visualizer.ShowStatusCard(
+          StatusBitmapName(arm_mode, active_zone.active,
+                           is_alarm_active, static_degraded),
+          coco_config::kStatusBitmapPosX, coco_config::kStatusBitmapPosY);
     }
 
     const auto log_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

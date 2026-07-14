@@ -24,7 +24,11 @@ class UartControlChannel {
     kFifoBytes = 32,
     kPollIntervalUs = 2000,
     kMaxLineBytes = 4096,
-    kTxChunkGapUs = 20,
+    // 32 bytes take about 2.78 ms on a 115200-baud 8N1 link.  The UART API
+    // writes into a 32-byte FIFO and requires callers to wait for that FIFO
+    // to drain before submitting the next chunk.  A 20-us gap can lose or
+    // strand the final FIFO contents, which corrupts SNAPSHOT/ACK boundaries.
+    kTxChunkGapUs = 3500,
   };
 
   uart_handle_t handle_;

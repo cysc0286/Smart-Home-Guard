@@ -104,16 +104,19 @@ class ControllerConfig:
     serial_idle_timeout_sec: float = 0.08
     serial_tx_chunk_bytes: int = 2
     serial_tx_chunk_gap_ms: float = 30.0
-    serial_ack_timeout_sec: float = 2.0
+    serial_ack_timeout_sec: float = 0.5
     serial_command_retries: int = 3
-    serial_require_ack: bool = True
+    serial_require_ack: bool = False
     board_ip: str = "192.168.1.88"
     board_port: int = 9000
     zone_file: str = DEFAULT_ZONE_FILE
     auto_send: bool = True
     auto_refresh_after_send: bool = True
     auto_exit_after_send: bool = True
-    auto_refresh_snapshot: bool = True
+    # A serial snapshot is about 24 KiB.  At 115200 baud it occupies the UART
+    # for roughly two seconds, so refreshing every 500 ms can starve runtime
+    # control and detection.  Refresh only on startup or when the user presses N.
+    auto_refresh_snapshot: bool = False
     alarm_classes: list[str] | str | None = None
     arm_mode: str = "AWAY"
     snapshot_refresh_interval_ms: int = 500
@@ -168,8 +171,8 @@ def load_controller_config(config_path: Path) -> ControllerConfig:
     config.auto_refresh_snapshot = bool(config.auto_refresh_snapshot)
     config.alarm_classes = normalize_alarm_classes(config.alarm_classes)
     config.arm_mode = str(config.arm_mode).strip().upper()
-    if config.arm_mode not in {"HOME", "AWAY", "SLEEP"}:
-        raise ValueError("arm_mode只能是HOME、AWAY或SLEEP")
+    if config.arm_mode not in {"HOME", "AWAY", "SLEEP", "CONFIG"}:
+        raise ValueError("arm_mode must be HOME, AWAY, SLEEP, or CONFIG")
     config.snapshot_source = str(config.snapshot_source).strip().lower()
     config.snapshot_url = str(config.snapshot_url)
     config.snapshot_file = str(config.snapshot_file)
@@ -263,7 +266,7 @@ class ZoneSender(Protocol):
     def display_target(self) -> str:
         ...
 
-    def set_mode(self, mode: str) -> None:
+    def set_mode(self, mode: str) -> str | None:
         ...
 
     def send(self, zone: Zone) -> str | None:
@@ -284,6 +287,9 @@ class TcpZoneSender:
             conn.sendall(payload)
         return None
 
+    def set_mode(self, mode: str) -> str | None:
+        raise RuntimeError("Mode switching requires the serial control channel")
+
     def display_target(self) -> str:
         return f"{self.board_ip}:{self.board_port}"
 
@@ -291,6 +297,14 @@ class TcpZoneSender:
 class SnapshotClient(Protocol):
     def fetch(self) -> SnapshotFrame:
         ...
+
+
+class BoardCommandError(RuntimeError):
+    """The board explicitly rejected a control command."""
+
+
+class AckTimeoutError(RuntimeError):
+    """A command may have run, but its complete ACK was not observed."""
 
 
 class HttpSnapshotClient:
@@ -336,9 +350,9 @@ class SerialControlClient:
         idle_timeout_sec: float,
         tx_chunk_bytes: int = 2,
         tx_chunk_gap_ms: float = 30.0,
-        ack_timeout_sec: float = 2.0,
+        ack_timeout_sec: float = 0.5,
         command_retries: int = 3,
-        require_ack: bool = True,
+        require_ack: bool = False,
         arm_mode: str = "AWAY",
     ) -> None:
         if serial is None:
@@ -353,77 +367,97 @@ class SerialControlClient:
         self.command_retries = max(int(command_retries), 1)
         self.require_ack = bool(require_ack)
         self.arm_mode = arm_mode
+        # SNAPSHOT and control commands share one UART stream.  Keep an entire
+        # request/response exchange atomic so a refresh cannot consume an ACK
+        # (or leave image bytes for the next command).
+        self._serial_lock = threading.RLock()
 
     def fetch(self) -> SnapshotFrame:
-        with self._open_serial() as ser:
-            ser.reset_input_buffer()
-            time.sleep(0.05)
-            ser.reset_input_buffer()
-            ser.write(b"SNAPSHOT\n")
-            ser.flush()
-            header = self._read_snapshot_header(ser)
-            parts = header.split()
-            if len(parts) != 6:
-                raise RuntimeError(f"板端快照头格式错误: {header}")
-            preview_width = int(parts[1])
-            preview_height = int(parts[2])
-            logical_width = int(parts[3])
-            logical_height = int(parts[4])
-            payload_size = int(parts[5])
-            payload = self._read_exact(ser, payload_size)
-            frame = self._decode_pgm(payload)
-            if frame.shape[1] != preview_width or frame.shape[0] != preview_height:
-                raise RuntimeError("板端快照尺寸与头信息不一致")
-            return SnapshotFrame(
-                image=frame,
-                logical_width=logical_width,
-                logical_height=logical_height,
-            )
+        with self._serial_lock:
+            with self._open_serial() as ser:
+                ser.reset_input_buffer()
+                time.sleep(0.05)
+                ser.reset_input_buffer()
+                ser.write(b"SNAPSHOT\n")
+                ser.flush()
+                header = self._read_snapshot_header(ser)
+                parts = header.split()
+                if len(parts) != 6:
+                    raise RuntimeError(f"板端快照头格式错误: {header}")
+                preview_width = int(parts[1])
+                preview_height = int(parts[2])
+                logical_width = int(parts[3])
+                logical_height = int(parts[4])
+                payload_size = int(parts[5])
+                payload = self._read_exact(ser, payload_size)
+                self._drain_snapshot_trailer(ser)
+                frame = self._decode_pgm(payload)
+                if frame.shape[1] != preview_width or frame.shape[0] != preview_height:
+                    raise RuntimeError("板端快照尺寸与头信息不一致")
+                return SnapshotFrame(
+                    image=frame,
+                    logical_width=logical_width,
+                    logical_height=logical_height,
+                )
 
     def send(self, zone: Zone) -> str | None:
-        with self._open_serial() as ser:
-            ser.reset_input_buffer()
-            payload = json.dumps(
-                zone.to_dict(), ensure_ascii=True, separators=(",", ":")
-            )
-            commands = (
-                (
-                    f"ZONE {payload}\n".encode("ascii"),
-                    b"OK ZONE",
-                    b"ERR ZONE",
-                    "ZONE",
-                ),
-                (f"MODE {self.arm_mode}\n".encode("ascii"), b"OK MODE", b"ERR CMD", "MODE"),
-                (b"START\n", b"OK START", b"ERR CMD", "START"),
-            )
-            if self.require_ack:
+        with self._serial_lock:
+            with self._open_serial() as ser:
+                ser.reset_input_buffer()
+                payload = json.dumps(
+                    zone.to_dict(), ensure_ascii=True, separators=(",", ":")
+                )
+                commands = (
+                    (
+                        f"ZONE {payload}\n".encode("ascii"),
+                        b"OK ZONE",
+                        b"ERR ZONE",
+                        "ZONE",
+                    ),
+                    (
+                        f"MODE {self.arm_mode}\n".encode("ascii"),
+                        f"OK MODE {self.arm_mode}".encode("ascii"),
+                        b"ERR MODE",
+                        "MODE",
+                    ),
+                    (b"START\n", b"OK START", b"ERR CMD", "START"),
+                )
+                if self.require_ack:
+                    for command, ok_marker, error_marker, command_name in commands:
+                        self._send_command_with_ack(
+                            ser, command, ok_marker, error_marker, command_name
+                        )
+                    return None
+
+                warnings = []
                 for command, ok_marker, error_marker, command_name in commands:
-                    self._send_command_with_ack(
+                    warning = self._send_command_best_effort(
                         ser, command, ok_marker, error_marker, command_name
                     )
-                return None
+                    if warning:
+                        warnings.append(warning)
+                return "; ".join(warnings) or None
 
-            warnings = []
-            for command, ok_marker, error_marker, command_name in commands:
-                warning = self._send_command_best_effort(
-                    ser, command, ok_marker, error_marker, command_name
-                )
-                if warning:
-                    warnings.append(warning)
-            return "; ".join(warnings) or None
-
-    def set_mode(self, mode: str) -> None:
+    def set_mode(self, mode: str) -> str | None:
         mode = mode.strip().upper()
-        if mode not in {"HOME", "AWAY", "SLEEP"}:
+        if mode not in {"HOME", "AWAY", "SLEEP", "CONFIG"}:
             raise ValueError(f"不支持的布防模式: {mode}")
-        with self._open_serial() as ser:
-            ser.reset_input_buffer()
-            command = f"MODE {mode}\n".encode("ascii")
-            if self.require_ack:
-                self._send_command_with_ack(ser, command, b"OK MODE", b"ERR CMD", "MODE")
-            else:
-                self._send_command_best_effort(ser, command, b"OK MODE", b"ERR CMD", "MODE")
+        with self._serial_lock:
+            with self._open_serial() as ser:
+                ser.reset_input_buffer()
+                command = f"MODE {mode}\n".encode("ascii")
+                ok_marker = f"OK MODE {mode}".encode("ascii")
+                if self.require_ack:
+                    self._send_command_with_ack(
+                        ser, command, ok_marker, b"ERR MODE", "MODE"
+                    )
+                    warning = None
+                else:
+                    warning = self._send_command_best_effort(
+                        ser, command, ok_marker, b"ERR MODE", "MODE"
+                    )
         self.arm_mode = mode
+        return warning
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -459,7 +493,9 @@ class SerialControlClient:
                     timeout_sec=self.ack_timeout_sec,
                 )
                 return
-            except RuntimeError as exc:
+            except BoardCommandError:
+                raise
+            except AckTimeoutError as exc:
                 last_error = exc
                 if attempt < self.command_retries:
                     time.sleep(0.1)
@@ -486,7 +522,7 @@ class SerialControlClient:
                 timeout_sec=self.ack_timeout_sec,
             )
             return None
-        except RuntimeError as exc:
+        except AckTimeoutError as exc:
             return f"{command_name} ACK unreadable ({exc})"
 
     def _wait_for_marker(
@@ -511,7 +547,7 @@ class SerialControlClient:
                     return
                 if error_marker in buffer:
                     received = bytes(buffer[:64]).hex(" ") or "<empty>"
-                    raise RuntimeError(
+                    raise BoardCommandError(
                         f"board returned {error_marker.decode('ascii')}; rx={received}"
                     )
                 if len(buffer) > max_scan_bytes:
@@ -519,7 +555,7 @@ class SerialControlClient:
         finally:
             ser.timeout = original_timeout
         received = bytes(buffer[:64]).hex(" ") or "<empty>"
-        raise RuntimeError(
+        raise AckTimeoutError(
             f"timeout waiting for {marker.decode('ascii', errors='ignore')}; rx={received}"
         )
 
@@ -546,29 +582,52 @@ class SerialControlClient:
         raise RuntimeError("串口快照响应中未找到 SNAPSHOT 头")
 
     def _read_exact(self, ser, size: int) -> bytes:
-        chunks: list[bytes] = []
-        remaining = size
+        payload = bytearray()
         last_data_time = time.monotonic()
         original_timeout = ser.timeout
         ser.timeout = 0.05
         try:
-            while remaining > 0:
-                chunk = ser.read(remaining)
+            while len(payload) < size:
+                chunk = ser.read(size - len(payload))
                 if not chunk:
-                    received = size - remaining
                     idle_sec = time.monotonic() - last_data_time
-                    if received > 0 and (remaining <= 128 or idle_sec >= self.idle_timeout_sec):
-                        chunks.append(b"\x00" * remaining)
-                        break
                     if idle_sec >= self.timeout_sec:
-                        raise RuntimeError("串口读取图片数据超时")
+                        raise RuntimeError(
+                            f"serial snapshot payload timeout: received "
+                            f"{len(payload)}/{size} bytes"
+                        )
                     continue
-                chunks.append(chunk)
-                remaining -= len(chunk)
+                payload.extend(chunk)
                 last_data_time = time.monotonic()
         finally:
             ser.timeout = original_timeout
-        return b"".join(chunks)
+        return bytes(payload)
+
+    def _drain_snapshot_trailer(self, ser) -> None:
+        """Discard transport padding after a complete snapshot payload.
+
+        New firmware appends two UART FIFO widths after the declared payload
+        to force the final QOI bytes onto the wire.  Waiting for a quiet period
+        here keeps those bytes out of the following ZONE/MODE transaction and
+        remains harmless with older firmware that sends no trailer.
+        """
+        quiet_sec = max(self.idle_timeout_sec, 0.05)
+        deadline = time.monotonic() + max(quiet_sec * 4.0, 0.25)
+        last_data_time = time.monotonic()
+        original_timeout = ser.timeout
+        ser.timeout = min(quiet_sec, 0.02)
+        try:
+            while time.monotonic() < deadline:
+                waiting = int(getattr(ser, "in_waiting", 0))
+                chunk = ser.read(waiting if waiting > 0 else 1)
+                now = time.monotonic()
+                if chunk:
+                    last_data_time = now
+                    continue
+                if now - last_data_time >= quiet_sec:
+                    break
+        finally:
+            ser.timeout = original_timeout
 
     def _decode_pgm(self, payload: bytes) -> np.ndarray:
         if payload.startswith(b"qoif"):
@@ -850,7 +909,7 @@ class ZoneDrawerApp:
         )
         cv2.putText(
             display,
-            "Click: redraw | click first: close | Z: undo | C: cancel draft | N: snapshot | S: apply | Q: quit",
+            "Click: redraw | click first: close | Z: undo | C: cancel draft | N: snapshot | S: apply | M: mode | Q: quit",
             (10, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -1092,12 +1151,18 @@ class ZoneDrawerApp:
                 elif key in (ord("z"), ord("Z"), 8):
                     self._undo_point()
                 elif key in (ord("m"), ord("M")):
-                    modes = ("HOME", "AWAY", "SLEEP")
+                    modes = ("HOME", "AWAY", "SLEEP", "CONFIG")
                     next_mode = modes[(modes.index(self.arm_mode) + 1) % len(modes)]
                     try:
-                        self.sender.set_mode(next_mode)
+                        warning = self.sender.set_mode(next_mode)
                         self.arm_mode = next_mode
-                        self.last_status = f"Arm mode set: {self.arm_mode}"
+                        if warning:
+                            self.last_status = (
+                                f"Arm mode sent: {self.arm_mode}; warning: {warning}"
+                            )
+                            print(f"[WARN] {warning}", file=sys.stderr)
+                        else:
+                            self.last_status = f"Arm mode set: {self.arm_mode}"
                     except (OSError, RuntimeError, ValueError) as exc:
                         self.last_status = f"Mode change failed: {exc}"
         finally:
@@ -1229,9 +1294,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--arm-mode",
-        choices=("HOME", "AWAY", "SLEEP"),
+        choices=("HOME", "AWAY", "SLEEP", "CONFIG"),
         default=None,
-        help="布防模式：HOME、AWAY或SLEEP",
+        help="布防模式：HOME、AWAY、SLEEP或CONFIG",
     )
     parser.add_argument(
         "--snapshot-refresh-interval-ms",
