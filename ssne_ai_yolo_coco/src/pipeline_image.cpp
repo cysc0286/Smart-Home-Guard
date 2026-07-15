@@ -5,8 +5,12 @@
 #include <iostream>
 #include <unistd.h>
 
-void IMAGEPROCESSOR::Initialize(std::array<int, 2>* in_img_shape)
+bool IMAGEPROCESSOR::Initialize(std::array<int, 2>* in_img_shape)
 {
+    if (initialized_) {
+        return true;
+    }
+
     img_shape = *in_img_shape;
 
     uint16_t img_width = static_cast<uint16_t>(img_shape[0]);
@@ -21,15 +25,19 @@ void IMAGEPROCESSOR::Initialize(std::array<int, 2>* in_img_shape)
     if (res0 != 0) {
         printf("[ERROR] Failed to open online pipeline!\n");
         printf("ret: %d\n", res0);
-        return;
+        return false;
     }
+    initialized_ = true;
     printf("[INFO] open online pipe0: %d \n", res0);
+    return true;
 }
 
 bool IMAGEPROCESSOR::GetImage(ssne_tensor_t* img_sensor) {
+    if (!initialized_) {
+        return false;
+    }
     const int capture_code = GetImageData(img_sensor, kPipeline0, kSensor0, 0);
     if (capture_code != 0) {
-        printf("[CAM] GetImageData failed, code=%d\n", capture_code);
         return false;
     }
     return true;
@@ -37,6 +45,10 @@ bool IMAGEPROCESSOR::GetImage(ssne_tensor_t* img_sensor) {
 
 void IMAGEPROCESSOR::Release()
 {
+    if (!initialized_) {
+        return;
+    }
     CloseOnlinePipeline(kPipeline0);
+    initialized_ = false;
     printf("[INFO] OnlinePipe closed!\n");
 }

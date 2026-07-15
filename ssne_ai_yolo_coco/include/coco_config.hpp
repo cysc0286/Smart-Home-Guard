@@ -44,8 +44,36 @@ static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 static const int   kRoiAlignment    = 8;       // Offline preprocess width/height alignment
 static const int   kRoiIntervalFrames = 5;    // Run local-zone inference every N frames
+static const int   kRoiRecoveryIntervalFrames = 10; // First recovery step after overload
+static const int   kRoiPriorityIntervalFrames = 2;  // Low-light/bright/target-lost search
 static const int   kRoiResultCacheMs = 400;   // Bridge frames between local inferences
+static const int   kRoiResultMaxFrameGap = 12; // Absolute stale-result ceiling; runtime also limits by interval
 static const int   kRoiFailureBackoffMs = 2000; // Avoid repeated SDK error-log floods
+static const float kRoiContainmentThreshold = 0.85f; // Conservative same-class nested-box dedup
+// ROI overload protection uses the full/base path, not total latency (which
+// intentionally contains serial ROI work). Values are calibrated against the
+// measured 28-30 ms full/base baseline on SC235HAI.
+static const float kRoiOverloadPathP95Ms = 45.0f;
+static const float kRoiRecoveryPathP95Ms = 35.0f;
+static const float kRoiOverloadAppFps = 20.0f;
+static const float kRoiRecoveryAppFps = 23.0f;
+// 25 FPS application target. Both the base path and the user-visible total
+// path are measured against this deadline; only base-path load drives the ROI
+// overload controller.
+static const float kApplicationDeadlineMs = 40.0f;
+// Test-only synthetic base-path load. Disabled by default and controlled over
+// UART with TEST LOAD ON/OFF.
+static const int   kTestLoadDelayMs = 20;
+// The high-frequency ROI stage is reserved for difficult scenes. It may only
+// be entered after the base path has remained healthy and the application FPS
+// still has enough headroom.
+static const float kRoiPriorityMinAppFps = 28.0f;
+static const int   kRoiOverloadVoteWindows = 2;
+static const int   kRoiRecoveryVoteWindows = 3;
+static const int   kRoiLoadWarmupWindows = 2;
+static const int   kRoiPriorityHoldoffWindows = 3;
+static const int   kRoiZoneChangeHoldoffWindows = 1;
+static const int   kRoiTargetLostFrames = 45;
 static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 0;
 static const int   kAlarmHoldMs     = 0;      // 检测丢失立即停止报警

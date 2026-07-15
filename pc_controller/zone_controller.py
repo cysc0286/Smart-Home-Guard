@@ -269,6 +269,9 @@ class ZoneSender(Protocol):
     def set_mode(self, mode: str) -> str | None:
         ...
 
+    def set_test(self, target: str, enabled: bool) -> str | None:
+        ...
+
     def send(self, zone: Zone) -> str | None:
         ...
 
@@ -289,6 +292,9 @@ class TcpZoneSender:
 
     def set_mode(self, mode: str) -> str | None:
         raise RuntimeError("Mode switching requires the serial control channel")
+
+    def set_test(self, target: str, enabled: bool) -> str | None:
+        raise RuntimeError("Test controls require the serial control channel")
 
     def display_target(self) -> str:
         return f"{self.board_ip}:{self.board_port}"
@@ -458,6 +464,26 @@ class SerialControlClient:
                     )
         self.arm_mode = mode
         return warning
+
+    def set_test(self, target: str, enabled: bool) -> str | None:
+        target = target.strip().upper()
+        if target not in {"LOAD", "CAM FAIL"}:
+            raise ValueError(f"Unsupported test target: {target}")
+        state = "ON" if enabled else "OFF"
+        command_name = f"TEST {target}"
+        with self._serial_lock:
+            with self._open_serial() as ser:
+                ser.reset_input_buffer()
+                command = f"TEST {target} {state}\n".encode("ascii")
+                ok_marker = f"OK TEST {target} {state}".encode("ascii")
+                if self.require_ack:
+                    self._send_command_with_ack(
+                        ser, command, ok_marker, b"ERR TEST", command_name
+                    )
+                    return None
+                return self._send_command_best_effort(
+                    ser, command, ok_marker, b"ERR TEST", command_name
+                )
 
     def display_target(self) -> str:
         return f"{self.port}@{self.baudrate}"
@@ -746,6 +772,8 @@ class ZoneDrawerApp:
         self.pending_zone: Zone | None = None
         self.last_status = "Starting: fetching board snapshot..."
         self.exit_requested = False
+        self.test_load_enabled = False
+        self.test_camera_fail_enabled = False
 
         self._snapshot_queue: queue.Queue = queue.Queue(maxsize=2)
         self._bg_stop = threading.Event()
@@ -909,7 +937,7 @@ class ZoneDrawerApp:
         )
         cv2.putText(
             display,
-            "Click: redraw | click first: close | Z: undo | C: cancel draft | N: snapshot | S: apply | M: mode | Q: quit",
+            "Click: redraw | Z: undo | C: cancel | N: snapshot | S: apply | M: mode | L: load test | F: camera test | Q: quit",
             (10, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -918,6 +946,19 @@ class ZoneDrawerApp:
         )
 
         return display
+
+    def _toggle_test(self, target: str, enabled_attr: str, label: str) -> None:
+        enabled = not bool(getattr(self, enabled_attr))
+        try:
+            warning = self.sender.set_test(target, enabled)
+            setattr(self, enabled_attr, enabled)
+            state = "ON" if enabled else "OFF"
+            self.last_status = f"{label}: {state}"
+            if warning:
+                self.last_status += f"; warning: {warning}"
+                print(f"[WARN] {warning}", file=sys.stderr)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.last_status = f"{label} failed: {exc}"
 
     def _draw_zone(
         self,
@@ -1165,6 +1206,12 @@ class ZoneDrawerApp:
                             self.last_status = f"Arm mode set: {self.arm_mode}"
                     except (OSError, RuntimeError, ValueError) as exc:
                         self.last_status = f"Mode change failed: {exc}"
+                elif key in (ord("l"), ord("L")):
+                    self._toggle_test("LOAD", "test_load_enabled", "Synthetic load")
+                elif key in (ord("f"), ord("F")):
+                    self._toggle_test(
+                        "CAM FAIL", "test_camera_fail_enabled", "Synthetic camera failure"
+                    )
         finally:
             self._bg_stop.set()
 
