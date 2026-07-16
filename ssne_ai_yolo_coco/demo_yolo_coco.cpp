@@ -60,11 +60,24 @@ enum class EnvPolicy {
   kBright
 };
 
+struct EnvLightStats {
+  bool valid = false;
+  int avg_luma = 0;
+  int y10 = 0;
+  int y50 = 0;
+  int y90 = 0;
+  int dark_ratio_pct = 0;
+  int clip_ratio_pct = 0;
+  int contrast = 0;
+};
+
 struct EnvPolicyState {
   EnvPolicy policy = EnvPolicy::kNormal;
-  int avg_luma = 0;
+  EnvLightStats light;
   int dark_votes = 0;
   int bright_votes = 0;
+  int normal_votes = 0;
+  int transitions = 0;
   float conf_threshold = coco_config::kConfThreshold;
   int alarm_hold_ms = coco_config::kAlarmHoldMs;
 };
@@ -116,6 +129,13 @@ struct AcceptanceStats {
   int roi_perf_samples = 0;
   int base_deadline_misses = 0;
   int total_deadline_misses = 0;
+  int post_detections = 0;
+  int tracker_matches = 0;
+  int tracker_center_matches = 0;
+  int tracker_new_tracks = 0;
+  int tracker_expired_tracks = 0;
+  int display_detections = 0;
+  int confirmed_detections = 0;
   long long capture_us_total = 0;
   long long full_infer_us_total = 0;
   long long roi_work_us_total = 0;
@@ -157,6 +177,25 @@ struct PerfWindow {
   }
 };
 
+struct PipelineWindowStats {
+  int frames = 0;
+  int post_detections = 0;
+  int matched_iou = 0;
+  int matched_center = 0;
+  int new_tracks = 0;
+  int unmatched_tracks = 0;
+  int expired_tracks = 0;
+  int display_detections = 0;
+  int confirmed_detections = 0;
+  int alarm_detections = 0;
+  int visible_track_samples = 0;
+  float best_match_iou_sum = 0.0f;
+  float best_match_iou_max = 0.0f;
+  int best_match_iou_count = 0;
+
+  void Clear() { *this = PipelineWindowStats(); }
+};
+
 const char* BoolText(bool value) {
   return value ? "ON" : "OFF";
 }
@@ -164,7 +203,7 @@ const char* BoolText(bool value) {
 const char* EnvPolicyName(EnvPolicy policy) {
   switch (policy) {
     case EnvPolicy::kLowLight: return "LOW_LIGHT";
-    case EnvPolicy::kBright: return "BRIGHT";
+    case EnvPolicy::kBright: return "OVEREXPOSED";
     case EnvPolicy::kNormal:
     default: return "NORMAL";
   }
@@ -290,39 +329,113 @@ double AverageUsAsMs(long long total_us, int samples) {
   return static_cast<double>(total_us) / (1000.0 * static_cast<double>(samples));
 }
 
-int SampleAverageLuma(const void* data_ptr, const std::array<int, 2>& crop_shape) {
-  if (data_ptr == nullptr) return 0;
+EnvLightStats SampleLightStats(const void* data_ptr,
+                               const std::array<int, 2>& crop_shape) {
+  EnvLightStats stats;
+  const int width = crop_shape[0];
+  const int height = crop_shape[1];
+  if (data_ptr == nullptr || width <= 0 || height <= 0) return stats;
+
   const unsigned char* src = static_cast<const unsigned char*>(data_ptr);
-  const int sample_count = 256;
-  const int total_pixels = crop_shape[0] * crop_shape[1];
+  const int columns = std::max(1, coco_config::kEnvSampleColumns);
+  const int rows = std::max(1, coco_config::kEnvSampleRows);
+  const int x0 = width / 10;
+  const int x1 = width - width / 10;
+  const int y0 = height / 10;
+  const int y1 = height - height / 10;
+  std::vector<unsigned char> samples;
+  samples.reserve(static_cast<size_t>(columns * rows));
   long sum = 0;
-  for (int i = 0; i < sample_count; ++i) {
-    const int p = (i * total_pixels) / sample_count;
-    sum += src[p * 2 + 1];
+  int dark_count = 0;
+  int clip_count = 0;
+  for (int row = 0; row < rows; ++row) {
+    const int y = std::min(height - 1,
+        y0 + ((2 * row + 1) * std::max(1, y1 - y0)) / (2 * rows));
+    for (int column = 0; column < columns; ++column) {
+      const int x = std::min(width - 1,
+          x0 + ((2 * column + 1) * std::max(1, x1 - x0)) / (2 * columns));
+      const unsigned char value = src[(y * width + x) * 2 + 1];
+      samples.push_back(value);
+      sum += value;
+      if (value < coco_config::kEnvDarkPixelY) ++dark_count;
+      if (value > coco_config::kEnvClipPixelY) ++clip_count;
+    }
   }
-  return static_cast<int>(sum / sample_count);
+
+  if (samples.empty()) return stats;
+  std::sort(samples.begin(), samples.end());
+  const size_t count = samples.size();
+  const auto percentile = [&samples, count](int pct) {
+    const size_t index = ((count - 1u) * static_cast<size_t>(pct)) / 100u;
+    return static_cast<int>(samples[index]);
+  };
+  stats.valid = true;
+  stats.avg_luma = static_cast<int>(sum / static_cast<long>(count));
+  stats.y10 = percentile(10);
+  stats.y50 = percentile(50);
+  stats.y90 = percentile(90);
+  stats.dark_ratio_pct = static_cast<int>((100u * static_cast<size_t>(dark_count) + count / 2u) / count);
+  stats.clip_ratio_pct = static_cast<int>((100u * static_cast<size_t>(clip_count) + count / 2u) / count);
+  stats.contrast = stats.y90 - stats.y10;
+  return stats;
 }
 
-bool UpdateEnvPolicy(int avg_luma, EnvPolicyState* state) {
+bool UpdateEnvPolicy(const EnvLightStats& light, EnvPolicyState* state) {
+  if (state == nullptr || !light.valid) return false;
   const EnvPolicy previous = state->policy;
-  state->avg_luma = avg_luma;
+  state->light = light;
 
-  if (avg_luma < coco_config::kEnvLowLightY) {
-    state->dark_votes++;
-    state->bright_votes = 0;
-  } else if (avg_luma > coco_config::kEnvBrightY) {
-    state->bright_votes++;
+  if (state->policy == EnvPolicy::kNormal) {
+    const bool low_candidate =
+        light.y50 < coco_config::kEnvLowMedianEnterY &&
+        light.dark_ratio_pct > coco_config::kEnvLowDarkEnterPct;
+    const bool bright_candidate =
+        light.clip_ratio_pct > coco_config::kEnvBrightClipEnterPct;
+    if (low_candidate) {
+      ++state->dark_votes;
+      state->bright_votes = 0;
+      state->normal_votes = 0;
+      if (state->dark_votes >= coco_config::kEnvLowEnterSamples) {
+        state->policy = EnvPolicy::kLowLight;
+      }
+    } else if (bright_candidate) {
+      ++state->bright_votes;
+      state->dark_votes = 0;
+      state->normal_votes = 0;
+      if (state->bright_votes >= coco_config::kEnvBrightEnterSamples) {
+        state->policy = EnvPolicy::kBright;
+      }
+    } else {
+      state->dark_votes = 0;
+      state->bright_votes = 0;
+      state->normal_votes = 0;
+    }
+  } else if (state->policy == EnvPolicy::kLowLight) {
+    const bool recovered =
+                    light.y50 >= coco_config::kEnvLowMedianExitY &&
+        light.dark_ratio_pct < coco_config::kEnvLowDarkExitPct;
     state->dark_votes = 0;
+    state->bright_votes = 0;
+    state->normal_votes = recovered ? state->normal_votes + 1 : 0;
+    if (state->normal_votes >= coco_config::kEnvLowExitSamples) {
+      state->policy = EnvPolicy::kNormal;
+    }
   } else {
+    const bool recovered =
+        light.clip_ratio_pct < coco_config::kEnvBrightClipExitPct;
     state->dark_votes = 0;
     state->bright_votes = 0;
-    state->policy = EnvPolicy::kNormal;
+    state->normal_votes = recovered ? state->normal_votes + 1 : 0;
+    if (state->normal_votes >= coco_config::kEnvBrightExitSamples) {
+      state->policy = EnvPolicy::kNormal;
+    }
   }
 
-  if (state->dark_votes >= coco_config::kEnvPolicyStableSamples) {
-    state->policy = EnvPolicy::kLowLight;
-  } else if (state->bright_votes >= coco_config::kEnvPolicyStableSamples) {
-    state->policy = EnvPolicy::kBright;
+  if (previous != state->policy) {
+    state->dark_votes = 0;
+    state->bright_votes = 0;
+    state->normal_votes = 0;
+    ++state->transitions;
   }
 
   if (state->policy == EnvPolicy::kLowLight) {
@@ -937,6 +1050,20 @@ float DetectionIoU(const CocoDetection& a, const CocoDetection& b) {
                        std::max(0.0f, a.box_xyxy[3] - a.box_xyxy[1]);
   const float area_b = std::max(0.0f, b.box_xyxy[2] - b.box_xyxy[0]) *
                        std::max(0.0f, b.box_xyxy[3] - b.box_xyxy[1]);
+  return inter / std::max(1e-6f, area_a + area_b - inter);
+}
+
+float BoxIoU(const std::array<float, 4>& a,
+             const std::array<float, 4>& b) {
+  const float x1 = std::max(a[0], b[0]);
+  const float y1 = std::max(a[1], b[1]);
+  const float x2 = std::min(a[2], b[2]);
+  const float y2 = std::min(a[3], b[3]);
+  const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+  const float area_a = std::max(0.0f, a[2] - a[0]) *
+                       std::max(0.0f, a[3] - a[1]);
+  const float area_b = std::max(0.0f, b[2] - b[0]) *
+                       std::max(0.0f, b[3] - b[1]);
   return inter / std::max(1e-6f, area_a + area_b - inter);
 }
 
@@ -1970,11 +2097,15 @@ int main() {
   auto last_snapshot_time = std::chrono::steady_clock::now() -
                             std::chrono::milliseconds(coco_config::kRunSnapshotUpdateIntervalMs);
   auto fps_window_start   = std::chrono::steady_clock::now();
-  auto last_brightness_log = std::chrono::steady_clock::now();
+  auto last_brightness_sample = std::chrono::steady_clock::now() -
+                                std::chrono::milliseconds(coco_config::kEnvSampleIntervalMs);
+  auto last_brightness_log = std::chrono::steady_clock::now() -
+                             std::chrono::milliseconds(coco_config::kEnvLogIntervalMs);
   auto acceptance_start    = std::chrono::steady_clock::now();
   constexpr int kDetLogIntervalMs    = coco_config::kDetectionSummaryLogMs;
   constexpr int kIdleLogIntervalMs   = 5000;
   constexpr int kFpsLogIntervalMs    = 1000;
+  constexpr int kBrightnessSampleMs  = coco_config::kEnvSampleIntervalMs;
   constexpr int kBrightnessLogMs     = coco_config::kEnvLogIntervalMs;
   constexpr int kLatencyReportEveryN = 60;   // 每 60 帧上报一次 P95 延迟
   constexpr float kSensorFps         = 45.0f;  // SC235HAI Task1: 1920x1080@45fps
@@ -2027,6 +2158,7 @@ int main() {
   latency_samples.reserve(kLatencyReportEveryN);
   PerfWindow perf_window;
   perf_window.Reserve(kLatencyReportEveryN);
+  PipelineWindowStats pipeline_window;
   bool selftest_camera_reported = false;
 
   auto invalidate_roi_cache = [&]() {
@@ -2307,18 +2439,47 @@ int main() {
         selftest_camera_reported = true;
       }
 
-      // 亮度统计 (鲁棒性): 采样 UYVY 中的 Y 通道
-      const auto bright_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          now - last_brightness_log).count();
-      if (bright_elapsed_ms >= kBrightnessLogMs) {
-        const int avg_y = SampleAverageLuma(tensor_info.data, crop_shape);
-        const bool policy_changed = UpdateEnvPolicy(avg_y, &env_state);
-        printf("[ENV]  avg_luma=%d  policy=%s  conf=%.2f  hold=%dms%s\n",
-               avg_y,
-               EnvPolicyName(env_state.policy),
-               env_state.conf_threshold,
-               env_state.alarm_hold_ms,
-               policy_changed ? "  changed=1" : "");
+      // Robust UYVY luminance sampling. State transitions use a faster
+      // cadence than the periodic telemetry so classroom light changes are
+      // handled promptly without flooding UART output.
+      const auto brightness_sample_elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - last_brightness_sample).count();
+      if (brightness_sample_elapsed_ms >= kBrightnessSampleMs) {
+        const EnvPolicy previous_policy = env_state.policy;
+        const EnvLightStats light = SampleLightStats(tensor_info.data, crop_shape);
+        const bool policy_changed = UpdateEnvPolicy(light, &env_state);
+        if (policy_changed) {
+          printf("[ENV][STATE] %s->%s y50=%d dark=%d%% clip=%d%% contrast=%d conf=%.2f hold=%dms\n",
+                 EnvPolicyName(previous_policy),
+                 EnvPolicyName(env_state.policy),
+                 light.y50,
+                 light.dark_ratio_pct,
+                 light.clip_ratio_pct,
+                 light.contrast,
+                 env_state.conf_threshold,
+                 env_state.alarm_hold_ms);
+        }
+        last_brightness_sample = now;
+      }
+
+      const auto brightness_log_elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - last_brightness_log).count();
+      if (brightness_log_elapsed_ms >= kBrightnessLogMs) {
+        if (env_state.light.valid) {
+          printf("[ENV] avg=%d y10=%d y50=%d y90=%d dark=%d%% clip=%d%% contrast=%d policy=%s conf=%.2f hold=%dms\n",
+                 env_state.light.avg_luma,
+                 env_state.light.y10,
+                 env_state.light.y50,
+                 env_state.light.y90,
+                 env_state.light.dark_ratio_pct,
+                 env_state.light.clip_ratio_pct,
+                 env_state.light.contrast,
+                 EnvPolicyName(env_state.policy),
+                 env_state.conf_threshold,
+                 env_state.alarm_hold_ms);
+        }
         last_brightness_log = now;
       }
     }
@@ -2488,22 +2649,79 @@ int main() {
 
     // 追踪和区域判断都在裁剪坐标系(1440x1080)下完成
     FilterDetectionsByAlarmClasses(&det_result, active_zone);
-
     tracker.Update(det_result);
-    CocoDetectionResult stable_crop = tracker.ConfirmedDetections();
+    const DebounceTracker::UpdateStats& tracker_stats =
+        tracker.LastUpdateStats();
+    CocoDetectionResult display_crop = tracker.DisplayDetections();
+    CocoDetectionResult confirmed_crop = tracker.ConfirmedDetections();
 
     // 判断完后坐标转回1920x1080给OSD显示
     std::vector<std::array<float, 4>> normal_boxes;
+    std::vector<std::array<float, 4>> display_alarm_candidates;
+    std::vector<std::array<float, 4>> confirmed_normal_boxes;
     std::vector<std::array<float, 4>> alarm_boxes;
-    ClassifyDetections(stable_crop, active_zone, arm_mode, &normal_boxes, &alarm_boxes);
+    ClassifyDetections(display_crop, active_zone, arm_mode,
+                       &normal_boxes, &display_alarm_candidates);
+    ClassifyDetections(confirmed_crop, active_zone, arm_mode,
+                       &confirmed_normal_boxes, &alarm_boxes);
+    (void)confirmed_normal_boxes;
+
+    // A new or briefly predicted track is immediately visible in green. It is
+    // promoted to red/alarm only after the independent confirmation path has
+    // accepted it. This keeps fast targets visible without weakening alarms.
+    for (const auto& candidate : display_alarm_candidates) {
+      bool confirmed = false;
+      for (const auto& confirmed_box : alarm_boxes) {
+        if (BoxIoU(candidate, confirmed_box) >= 0.5f) {
+          confirmed = true;
+          break;
+        }
+      }
+      if (!confirmed) {
+        normal_boxes.push_back(candidate);
+      }
+    }
+
+    ++pipeline_window.frames;
+    pipeline_window.post_detections +=
+        static_cast<int>(det_result.detections.size());
+    pipeline_window.matched_iou += tracker_stats.matched_iou;
+    pipeline_window.matched_center += tracker_stats.matched_center;
+    pipeline_window.new_tracks += tracker_stats.new_tracks;
+    pipeline_window.unmatched_tracks += tracker_stats.unmatched_tracks;
+    pipeline_window.expired_tracks += tracker_stats.expired_tracks;
+    pipeline_window.display_detections +=
+        static_cast<int>(display_crop.detections.size());
+    pipeline_window.confirmed_detections +=
+        static_cast<int>(confirmed_crop.detections.size());
+    pipeline_window.alarm_detections += static_cast<int>(alarm_boxes.size());
+    pipeline_window.visible_track_samples += tracker_stats.visible_tracks;
+    pipeline_window.best_match_iou_sum += tracker_stats.best_match_iou_sum;
+    pipeline_window.best_match_iou_max = std::max(
+        pipeline_window.best_match_iou_max, tracker_stats.best_match_iou_max);
+    pipeline_window.best_match_iou_count +=
+        tracker_stats.matched_iou + tracker_stats.matched_center;
+
+    accept_stats.post_detections +=
+        static_cast<int>(det_result.detections.size());
+    accept_stats.tracker_matches +=
+        tracker_stats.matched_iou + tracker_stats.matched_center;
+    accept_stats.tracker_center_matches += tracker_stats.matched_center;
+    accept_stats.tracker_new_tracks += tracker_stats.new_tracks;
+    accept_stats.tracker_expired_tracks += tracker_stats.expired_tracks;
+    accept_stats.display_detections +=
+        static_cast<int>(display_crop.detections.size());
+    accept_stats.confirmed_detections +=
+        static_cast<int>(confirmed_crop.detections.size());
     ConvertCropBoxesToOriginal(&normal_boxes);
     ConvertCropBoxesToOriginal(&alarm_boxes);
 
-    CocoDetectionResult stable_display = stable_crop;
+    CocoDetectionResult stable_display = display_crop;
     ConvertCropBoxesToOriginal(&stable_display);
 
-    const bool has_object       = !stable_crop.detections.empty();
-    if (has_object) {
+    const bool has_object = !display_crop.detections.empty();
+    const bool raw_has_object = !det_result.detections.empty();
+    if (raw_has_object) {
       no_detection_frames = 0;
     } else if (no_detection_frames < coco_config::kRoiTargetLostFrames +
                                       kLatencyReportEveryN) {
@@ -2512,7 +2730,7 @@ int main() {
     const bool raw_alarm_active = !alarm_boxes.empty();
     CocoDetection best_alarm_detection;
     const bool has_best_alarm = FindBestAlarmDetection(
-        stable_crop, active_zone, arm_mode, &best_alarm_detection);
+        confirmed_crop, active_zone, arm_mode, &best_alarm_detection);
     const bool lifecycle_changed = alarm_lifecycle.Update(
         raw_alarm_active, std::chrono::duration_cast<std::chrono::milliseconds>(
                               now.time_since_epoch()).count(),
@@ -2530,7 +2748,7 @@ int main() {
     }
     if (has_object) {
       ++accept_stats.detection_frames;
-      accept_stats.detections += static_cast<int>(stable_crop.detections.size());
+      accept_stats.detections += static_cast<int>(display_crop.detections.size());
     }
     if (is_alarm_active) {
       ++accept_stats.alarm_frames;
@@ -2651,18 +2869,49 @@ int main() {
           100.0f * perf_window.base_deadline_misses / perf_sample_count;
       const float total_miss_pct =
           100.0f * perf_window.total_deadline_misses / perf_sample_count;
+      const float average_match_iou =
+          pipeline_window.best_match_iou_count > 0
+              ? pipeline_window.best_match_iou_sum /
+                    static_cast<float>(pipeline_window.best_match_iou_count)
+              : 0.0f;
+      printf("[PIPE] frames=%d post=%d match_iou=%d match_center=%d new=%d unmatched=%d expired=%d visible=%d display=%d confirmed=%d alarm=%d match_iou_avg=%.3f match_iou_max=%.3f\n",
+             pipeline_window.frames,
+             pipeline_window.post_detections,
+             pipeline_window.matched_iou,
+             pipeline_window.matched_center,
+             pipeline_window.new_tracks,
+             pipeline_window.unmatched_tracks,
+             pipeline_window.expired_tracks,
+             pipeline_window.visible_track_samples,
+             pipeline_window.display_detections,
+             pipeline_window.confirmed_detections,
+             pipeline_window.alarm_detections,
+             average_match_iou,
+             pipeline_window.best_match_iou_max);
       const bool priority_roi = active_zone.active && detector_ready &&
           (env_state.policy != EnvPolicy::kNormal ||
            no_detection_frames >= coco_config::kRoiTargetLostFrames);
-      const bool overloaded =
+      const bool base_overloaded =
           full_p95 > coco_config::kRoiOverloadPathP95Ms ||
           base_p95 > coco_config::kRoiOverloadPathP95Ms ||
           (last_app_fps > 0.0f &&
            last_app_fps < coco_config::kRoiOverloadAppFps);
-      const bool healthy =
+      const bool base_healthy =
           full_p95 < coco_config::kRoiRecoveryPathP95Ms &&
           base_p95 < coco_config::kRoiRecoveryPathP95Ms &&
           last_app_fps >= coco_config::kRoiRecoveryAppFps;
+      const bool total_pressured =
+          (total_p95 > coco_config::kRoiTotalPressureP95Ms &&
+           total_miss_pct > coco_config::kRoiTotalRecoveryMissPct) ||
+          total_miss_pct > coco_config::kRoiTotalPressureMissPct;
+      const bool total_severe =
+          total_p95 > coco_config::kRoiTotalSevereP95Ms ||
+          total_miss_pct > coco_config::kRoiTotalSevereMissPct;
+      const bool total_healthy =
+          total_p95 < coco_config::kRoiTotalRecoveryP95Ms &&
+          total_miss_pct < coco_config::kRoiTotalRecoveryMissPct;
+      const bool overloaded = base_overloaded || total_pressured;
+      const bool healthy = base_healthy && total_healthy;
       const bool priority_healthy =
           priority_roi && healthy &&
           last_app_fps >= coco_config::kRoiPriorityMinAppFps;
@@ -2691,8 +2940,21 @@ int main() {
         if (roi_load.overload_votes >=
                 coco_config::kRoiOverloadVoteWindows &&
             roi_load.state != RoiLoadState::kPaused) {
-          roi_load.state = RoiLoadState::kPaused;
-          transition_reason = "overload";
+          switch (roi_load.state) {
+            case RoiLoadState::kEvery2:
+              roi_load.state = RoiLoadState::kEvery5;
+              break;
+            case RoiLoadState::kEvery5:
+              roi_load.state = RoiLoadState::kEvery10;
+              break;
+            case RoiLoadState::kEvery10:
+              roi_load.state = RoiLoadState::kPaused;
+              break;
+            case RoiLoadState::kPaused:
+              break;
+          }
+          transition_reason = total_severe
+              ? "severe-pressure-step" : "pressure-step";
         } else if (roi_load.state == RoiLoadState::kPaused &&
                    roi_load.recovery_votes >=
                        coco_config::kRoiRecoveryVoteWindows) {
@@ -2729,12 +2991,16 @@ int main() {
           roi_load.recovery_votes = 0;
           invalidate_roi_cache();
           roi_frame_index = 0;
-          printf("[LOAD] roi=%s->%s reason=%s full_p95=%.2fms base_p95=%.2fms app=%.1f priority=%d holdoff=%d\n",
+          printf("[LOAD] roi=%s->%s reason=%s full_p95=%.2fms base_p95=%.2fms total_p95=%.2fms total_miss=%.1f%% pressure=%d severe=%d app=%.1f priority=%d holdoff=%d\n",
                  RoiLoadStateName(previous_load_state),
                  RoiLoadStateName(roi_load.state),
                  transition_reason ? transition_reason : "policy",
                  full_p95,
                  base_p95,
+                 total_p95,
+                 total_miss_pct,
+                 total_pressured ? 1 : 0,
+                 total_severe ? 1 : 0,
                  last_app_fps,
                  priority_roi ? 1 : 0,
                  roi_load.priority_holdoff_windows);
@@ -2743,7 +3009,7 @@ int main() {
         }
       }
 
-      printf("[PERF] n=%zu roi_n=%zu cap_p95=%.2fms full_p95=%.2fms roi_p95=%.2fms osd_p95=%.2fms base_p95=%.2fms total_p95=%.2fms deadline=%.1fms base_miss=%.1f%% total_miss=%.1f%% load=%s interval=%d app=%.1f votes=%d/%d priority=%d ready=%d holdoff=%d test=%d/%d\n",
+      printf("[PERF] n=%zu roi_n=%zu cap_p95=%.2fms full_p95=%.2fms roi_p95=%.2fms osd_p95=%.2fms base_p95=%.2fms total_p95=%.2fms deadline=%.1fms base_miss=%.1f%% total_miss=%.1f%% load=%s interval=%d app=%.1f votes=%d/%d priority=%d ready=%d holdoff=%d pressure=%d severe=%d test=%d/%d\n",
              perf_window.total_loop_us.size(),
              perf_window.roi_work_us.size(),
              cap_p95,
@@ -2763,10 +3029,13 @@ int main() {
              priority_roi ? 1 : 0,
              priority_healthy ? 1 : 0,
              roi_load.priority_holdoff_windows,
+             total_pressured ? 1 : 0,
+             total_severe ? 1 : 0,
              test_control.load_enabled ? 1 : 0,
              test_control.camera_fail_enabled ? 1 : 0);
       latency_samples.clear();
       perf_window.Clear();
+      pipeline_window.Clear();
     }
 
     if (coco_config::kEnableAcceptanceMode && !accept_stats.summary_printed) {
@@ -2821,6 +3090,18 @@ int main() {
                 RoiLoadIntervalFrames(roi_load.state),
                 EnvPolicyName(env_state.policy),
                ArmModeName(arm_mode));
+        printf("[CHECK][ENV] policy=%s transitions=%d avg=%d y10=%d y50=%d y90=%d dark=%d%% clip=%d%% contrast=%d conf=%.2f hold=%dms\n",
+               EnvPolicyName(env_state.policy),
+               env_state.transitions,
+               env_state.light.avg_luma,
+               env_state.light.y10,
+               env_state.light.y50,
+               env_state.light.y90,
+               env_state.light.dark_ratio_pct,
+               env_state.light.clip_ratio_pct,
+               env_state.light.contrast,
+               env_state.conf_threshold,
+               env_state.alarm_hold_ms);
         printf("[CHECK][PERF] samples=%d roi_samples=%d cap_avg=%.2fms full_avg=%.2fms roi_avg=%.2fms osd_avg=%.2fms base_avg=%.2fms total_avg=%.2fms deadline=%.1fms base_miss=%.1f%% total_miss=%.1f%%\n",
                accept_stats.perf_samples,
                accept_stats.roi_perf_samples,
@@ -2833,8 +3114,16 @@ int main() {
                coco_config::kApplicationDeadlineMs,
                100.0f * accept_stats.base_deadline_misses /
                    static_cast<float>(std::max(1, accept_stats.perf_samples)),
-               100.0f * accept_stats.total_deadline_misses /
-                   static_cast<float>(std::max(1, accept_stats.perf_samples)));
+                100.0f * accept_stats.total_deadline_misses /
+                    static_cast<float>(std::max(1, accept_stats.perf_samples)));
+        printf("[CHECK][PIPE] post=%d matches=%d center_matches=%d new_tracks=%d expired_tracks=%d display=%d confirmed=%d\n",
+               accept_stats.post_detections,
+               accept_stats.tracker_matches,
+               accept_stats.tracker_center_matches,
+               accept_stats.tracker_new_tracks,
+               accept_stats.tracker_expired_tracks,
+               accept_stats.display_detections,
+               accept_stats.confirmed_detections);
         accept_stats.summary_printed = true;
       }
     }
