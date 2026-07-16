@@ -44,19 +44,79 @@ static const float kNmsThreshold    = 0.45f;
 static const int   kKeepTopK        = 30;
 static const int   kRoiAlignment    = 8;       // Offline preprocess width/height alignment
 static const int   kRoiIntervalFrames = 5;    // Run local-zone inference every N frames
+static const int   kRoiRecoveryIntervalFrames = 10; // First recovery step after overload
+static const int   kRoiPriorityIntervalFrames = 2;  // Low-light/bright/target-lost search
 static const int   kRoiResultCacheMs = 400;   // Bridge frames between local inferences
+static const int   kRoiResultMaxFrameGap = 12; // Absolute stale-result ceiling; runtime also limits by interval
 static const int   kRoiFailureBackoffMs = 2000; // Avoid repeated SDK error-log floods
+static const float kRoiContainmentThreshold = 0.85f; // Conservative same-class nested-box dedup
+// ROI overload protection uses the full/base path as the primary signal and
+// total latency/deadline misses as a secondary pressure signal. Values are
+// calibrated against the measured 28-30 ms full/base baseline on SC235HAI.
+static const float kRoiOverloadPathP95Ms = 45.0f;
+static const float kRoiRecoveryPathP95Ms = 35.0f;
+static const float kRoiOverloadAppFps = 20.0f;
+static const float kRoiRecoveryAppFps = 23.0f;
+// Total-path pressure is used as a secondary load signal.  It must agree with
+// deadline misses before normal pressure is declared, while a severe spike may
+// request one immediate downshift step.  The controller still changes only one
+// ROI frequency level at a time.
+static const float kRoiTotalPressureP95Ms = 60.0f;
+static const float kRoiTotalRecoveryP95Ms = 50.0f;
+static const float kRoiTotalSevereP95Ms = 80.0f;
+static const float kRoiTotalPressureMissPct = 12.0f;
+static const float kRoiTotalRecoveryMissPct = 8.0f;
+static const float kRoiTotalSevereMissPct = 25.0f;
+// 25 FPS application target. Both the base path and the user-visible total
+// path are measured against this deadline; total-path pressure can now reduce
+// ROI frequency gradually even when the base path remains healthy.
+static const float kApplicationDeadlineMs = 40.0f;
+// Test-only synthetic base-path load. Disabled by default and controlled over
+// UART with TEST LOAD ON/OFF.
+static const int   kTestLoadDelayMs = 20;
+// The high-frequency ROI stage is reserved for difficult scenes. It may only
+// be entered after the base path has remained healthy and the application FPS
+// still has enough headroom.
+static const float kRoiPriorityMinAppFps = 28.0f;
+static const int   kRoiOverloadVoteWindows = 2;
+static const int   kRoiRecoveryVoteWindows = 3;
+static const int   kRoiLoadWarmupWindows = 2;
+static const int   kRoiPriorityHoldoffWindows = 3;
+static const int   kRoiZoneChangeHoldoffWindows = 1;
+static const int   kRoiTargetLostFrames = 45;
+// Fast-motion tracking and display policy.  Alarm output still requires the
+// original confirmation time and a detection matched in the current frame.
+static const float kTrackerIoUThreshold = 0.18f;
+static const float kTrackerCenterGate = 0.75f;
+static const float kTrackerSizeRatioGate = 2.5f;
+static const float kTrackerVelocityAlpha = 0.5f;
+static const int   kTrackRetentionMs = 250;
+static const int   kDisplayHoldMs = 180;
 static const int   kAlarmConfirmMs  = 800;
 static const int   kAlarmClearMs    = 0;
 static const int   kAlarmHoldMs     = 0;      // 检测丢失立即停止报警
-static const int   kLowLightAlarmHoldMs = 0;
+static const int   kLowLightAlarmHoldMs = 800;
 static const int   kAlarmEventClearMs = 1500;
-static const int   kEnvLowLightY     = 40;
-static const int   kEnvBrightY       = 210;
-static const int   kEnvPolicyStableSamples = 3;
+
+// Robust classroom-light sampling and hysteresis thresholds.
+static const int   kEnvSampleIntervalMs = 250;
 static const int   kEnvLogIntervalMs = 2000;
-static const float kLowLightConfThreshold = 0.25f;
-static const float kBrightConfThreshold   = 0.35f;
+static const int   kEnvSampleColumns = 24;
+static const int   kEnvSampleRows = 18;
+static const int   kEnvDarkPixelY = 30;
+static const int   kEnvClipPixelY = 235;
+static const int   kEnvLowMedianEnterY = 35;
+static const int   kEnvLowMedianExitY = 46;
+static const int   kEnvLowDarkEnterPct = 55;
+static const int   kEnvLowDarkExitPct = 35;
+static const int   kEnvBrightClipEnterPct = 25;
+static const int   kEnvBrightClipExitPct = 15;
+static const int   kEnvLowEnterSamples = 8;
+static const int   kEnvLowExitSamples = 12;
+static const int   kEnvBrightEnterSamples = 8;
+static const int   kEnvBrightExitSamples = 12;
+static const float kLowLightConfThreshold = 0.27f;
+static const float kBrightConfThreshold = 0.33f;
 
 // OSD颜色LUT索引（colorLUT.sscl）
 static const int   kColorAlarmBox   = 0;   // Red    - object inside danger zone

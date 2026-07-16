@@ -62,7 +62,7 @@ class IMAGEPROCESSOR {
       * \return none
       */
     // void Initialize(std::array<int, 2>* in_img_shape, BinningRatioType in_scale);
-    void Initialize(std::array<int, 2>* in_img_shape);
+    bool Initialize(std::array<int, 2>* in_img_shape);
     /**
      * 获取offline或者online的图像。
      * 
@@ -78,12 +78,15 @@ class IMAGEPROCESSOR {
     // 释放资源
     void Release();
 
+    bool IsInitialized() const { return initialized_; }
+
     // 前处理时，模型推理输入的原始待检测图像尺寸，（width，height）
     std::array<int, 2> img_shape;
   
   private:
     // online setting
-    uint8_t format_online;
+    uint8_t format_online = SSNE_YUV422_16;
+    bool initialized_ = false;
 };
 
 
